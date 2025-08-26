@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"testing"
+	"time"
 )
 
 // mockClient is a minimal stub for testing purposes.
@@ -555,5 +556,133 @@ func TestDefaultConfigWithBufferPool(t *testing.T) {
 	}
 	if cfg.MaxRetries != 3 {
 		t.Errorf("expected default MaxRetries to be 3, got %d", cfg.MaxRetries)
+	}
+}
+
+func TestUploadController(t *testing.T) {
+	controller := NewUploadController()
+	
+	// Test initial state
+	if controller.State() != StateRunning {
+		t.Errorf("expected initial state to be StateRunning, got %v", controller.State())
+	}
+	
+	// Test pause
+	controller.Pause()
+	if controller.State() != StatePaused {
+		t.Errorf("expected state to be StatePaused after pause, got %v", controller.State())
+	}
+	
+	// Test resume
+	controller.Resume()
+	if controller.State() != StateRunning {
+		t.Errorf("expected state to be StateRunning after resume, got %v", controller.State())
+	}
+	
+	// Test cancel
+	controller.Cancel()
+	if controller.State() != StateCancelled {
+		t.Errorf("expected state to be StateCancelled after cancel, got %v", controller.State())
+	}
+}
+
+func TestCheckpoint(t *testing.T) {
+	checkpoint := Checkpoint{
+		LocalPath:      "/path/to/local/file.txt",
+		RemotePath:     "/path/to/remote/file.txt",
+		UploadID:       "test-upload-123",
+		FileSize:       1024000,
+		ChunkSize:      1024,
+		BytesUploaded:  512000,
+		ChunksUploaded: 500,
+		TotalChunks:    1000,
+		Timestamp:      time.Now(),
+	}
+	
+	// Test checkpoint fields
+	if checkpoint.LocalPath != "/path/to/local/file.txt" {
+		t.Errorf("unexpected LocalPath: %s", checkpoint.LocalPath)
+	}
+	if checkpoint.BytesUploaded != 512000 {
+		t.Errorf("unexpected BytesUploaded: %d", checkpoint.BytesUploaded)
+	}
+	if checkpoint.ChunksUploaded != 500 {
+		t.Errorf("unexpected ChunksUploaded: %d", checkpoint.ChunksUploaded)
+	}
+}
+
+func TestSaveAndLoadCheckpoint(t *testing.T) {
+	checkpoint := Checkpoint{
+		LocalPath:      "/test/file.txt",
+		RemotePath:     "remote/file.txt",
+		UploadID:       "test-123",
+		FileSize:       1000,
+		ChunkSize:      100,
+		BytesUploaded:  500,
+		ChunksUploaded: 5,
+		TotalChunks:    10,
+		Timestamp:      time.Now().Truncate(time.Second), // Truncate for comparison
+	}
+	
+	// Create temp file
+	tmpFile := "/tmp/test_checkpoint.json"
+	defer os.Remove(tmpFile)
+	
+	// Save checkpoint
+	err := SaveCheckpoint(checkpoint, tmpFile)
+	if err != nil {
+		t.Fatalf("failed to save checkpoint: %v", err)
+	}
+	
+	// Load checkpoint
+	loaded, err := LoadCheckpoint(tmpFile)
+	if err != nil {
+		t.Fatalf("failed to load checkpoint: %v", err)
+	}
+	
+	// Compare
+	if loaded.LocalPath != checkpoint.LocalPath {
+		t.Errorf("LocalPath mismatch: %s != %s", loaded.LocalPath, checkpoint.LocalPath)
+	}
+	if loaded.BytesUploaded != checkpoint.BytesUploaded {
+		t.Errorf("BytesUploaded mismatch: %d != %d", loaded.BytesUploaded, checkpoint.BytesUploaded)
+	}
+	if loaded.UploadID != checkpoint.UploadID {
+		t.Errorf("UploadID mismatch: %s != %s", loaded.UploadID, checkpoint.UploadID)
+	}
+}
+
+func TestUploadFileResumable(t *testing.T) {
+	c := NewClient("http://example.com", "user", "pass")
+	config := DefaultConfig()
+	
+	// Test that controller is created
+	controller, err := c.UploadFileResumable("/nonexistent", "remote", config)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if controller == nil {
+		t.Error("expected controller to be created")
+	}
+	if controller.State() != StateRunning {
+		t.Errorf("expected initial state to be StateRunning, got %v", controller.State())
+	}
+}
+
+func TestNewPauseResumeEvents(t *testing.T) {
+	events := []UploadEvent{
+		EventUploadPaused,
+		EventUploadResumed,
+	}
+	
+	expectedEvents := []string{
+		"upload_paused",
+		"upload_resumed",
+	}
+	
+	for i, event := range events {
+		if string(event) != expectedEvents[i] {
+			t.Errorf("expected event %s, got %s", expectedEvents[i], string(event))
+		}
 	}
 }

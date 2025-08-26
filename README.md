@@ -22,6 +22,11 @@
   - Context support for cancellation
   - Input validation and sanitization
   - Efficient error handling with custom error types
+- **Pause/Resume functionality:**
+  - Pause and resume uploads at any time
+  - Automatic checkpoint saving and loading
+  - Resume from interruptions or failures
+  - Graceful handling of network disconnections
 
 ## Installation
 
@@ -63,13 +68,46 @@ You can customize upload behavior using the `Config` struct:
 
 ```go
 type Config struct {
-	ChunkSize    int64                   // Chunk size in bytes (default 10MB)
-	SkipExisting bool                    // Skip files that exist with same size
-	Verbose      bool                    // Enable verbose logging
-	ProgressFunc func(info ProgressInfo) // Progress callback with detailed info
-	EventFunc    func(info EventInfo)    // Event callback for upload lifecycle
-	MaxRetries   int                     // Maximum retry attempts for failed chunks (default 3)
-	BufferPool   *BufferPool             // Optional buffer pool for memory reuse
+	ChunkSize       int64                   // Chunk size in bytes (default 10MB)
+	SkipExisting    bool                    // Skip files that exist with same size
+	Verbose         bool                    // Enable verbose logging
+	ProgressFunc    func(info ProgressInfo) // Progress callback with detailed info
+	EventFunc       func(info EventInfo)    // Event callback for upload lifecycle
+	MaxRetries      int                     // Maximum retry attempts for failed chunks (default 3)
+	BufferPool      *BufferPool             // Optional buffer pool for memory reuse
+	Controller      *UploadController       // Upload controller for pause/resume (optional)
+	CheckpointFunc  func(cp Checkpoint)     // Checkpoint callback for resume functionality
+	ResumeFromCheckpoint *Checkpoint        // Resume from this checkpoint (optional)
+}
+```
+
+### Pause/Resume Functionality
+
+Enable pause and resume for large file uploads:
+
+```go
+// Create an upload controller
+controller := godav.NewUploadController()
+config.Controller = controller
+
+// Setup checkpoint saving
+config.CheckpointFunc = func(checkpoint godav.Checkpoint) {
+    // Save checkpoint to file, database, etc.
+    godav.SaveCheckpoint(checkpoint, "/tmp/upload_checkpoint.json")
+}
+
+// Start resumable upload
+controller, err := client.UploadFileResumable(localPath, remotePath, config)
+
+// Control upload programmatically
+controller.Pause()  // Pause the upload
+controller.Resume() // Resume the upload
+controller.Cancel() // Cancel the upload
+
+// Resume from a saved checkpoint
+checkpoint, err := godav.LoadCheckpoint("/tmp/upload_checkpoint.json")
+if err == nil {
+    err = client.ResumeUpload(*checkpoint, config)
 }
 ```
 
@@ -149,6 +187,8 @@ config.EventFunc = func(info godav.EventInfo) {
 - `EventUploadComplete` - Entire upload process finished
 - `EventUploadFailed` - Upload failed
 - `EventUploadSkipped` - File skipped (already exists)
+- `EventUploadPaused` - Upload paused
+- `EventUploadResumed` - Upload resumed from checkpoint
 
 ### Error Handling
 
@@ -170,6 +210,8 @@ if err != nil {
 2. **Optimize chunk size**: Larger chunks = fewer requests, but more memory usage
 3. **Set appropriate retries**: Balance reliability vs. performance
 4. **Use context**: Implement timeouts and cancellation for better UX
+5. **Enable pause/resume**: For large files, use checkpoints to recover from interruptions
+6. **Handle signals**: Implement graceful shutdown with checkpoint saving
 
 ## License
 

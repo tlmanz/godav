@@ -1,7 +1,9 @@
 package godav
 
 import (
+	"encoding/json"
 	"testing"
+	"time"
 )
 
 func BenchmarkBufferPool(b *testing.B) {
@@ -67,5 +69,37 @@ func BenchmarkValidateConfig(b *testing.B) {
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = c.validateConfig(config)
+	}
+}
+
+func BenchmarkUploadController(b *testing.B) {
+	controller := NewUploadController()
+	
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		controller.Pause()
+		controller.Resume()
+		_ = controller.State()
+	}
+}
+
+func BenchmarkCheckpointSerialization(b *testing.B) {
+	checkpoint := Checkpoint{
+		LocalPath:      "/test/file.txt",
+		RemotePath:     "remote/file.txt", 
+		UploadID:       "test-123",
+		FileSize:       1000000,
+		ChunkSize:      10240,
+		BytesUploaded:  500000,
+		ChunksUploaded: 48,
+		TotalChunks:    97,
+		Timestamp:      time.Now(),
+	}
+	
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		data, _ := json.Marshal(checkpoint)
+		var cp Checkpoint
+		_ = json.Unmarshal(data, &cp)
 	}
 }

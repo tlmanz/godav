@@ -4,6 +4,7 @@ package godav
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -45,6 +46,8 @@ const (
 	EventUploadComplete UploadEvent = "upload_complete" // Entire upload process finished
 	EventUploadFailed   UploadEvent = "upload_failed"   // Upload failed
 	EventUploadSkipped  UploadEvent = "upload_skipped"  // File skipped (already exists)
+	EventUploadPaused   UploadEvent = "upload_paused"   // Upload paused
+	EventUploadResumed  UploadEvent = "upload_resumed"  // Upload resumed from checkpoint
 )
 
 // UploadError represents errors that occur during upload
@@ -66,6 +69,79 @@ func (e *UploadError) Unwrap() error {
 	return e.Err
 }
 
+// UploadState represents the current state of an upload
+type UploadState int
+
+const (
+	StateRunning UploadState = iota
+	StatePaused
+	StateCancelled
+)
+
+// UploadController provides pause/resume functionality for uploads
+type UploadController struct {
+	state    UploadState
+	stateCh  chan UploadState
+	pauseCh  chan struct{}
+	resumeCh chan struct{}
+}
+
+// NewUploadController creates a new upload controller
+func NewUploadController() *UploadController {
+	return &UploadController{
+		state:    StateRunning,
+		stateCh:  make(chan UploadState, 1),
+		pauseCh:  make(chan struct{}, 1),
+		resumeCh: make(chan struct{}, 1),
+	}
+}
+
+// Pause pauses the upload
+func (uc *UploadController) Pause() {
+	if uc.state == StateRunning {
+		uc.state = StatePaused
+		select {
+		case uc.pauseCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// Resume resumes the upload
+func (uc *UploadController) Resume() {
+	if uc.state == StatePaused {
+		uc.state = StateRunning
+		select {
+		case uc.resumeCh <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// Cancel cancels the upload
+func (uc *UploadController) Cancel() {
+	uc.state = StateCancelled
+}
+
+// State returns the current upload state
+func (uc *UploadController) State() UploadState {
+	return uc.state
+}
+
+// Checkpoint represents a resumable upload checkpoint
+type Checkpoint struct {
+	LocalPath    string    `json:"local_path"`
+	RemotePath   string    `json:"remote_path"`
+	UploadID     string    `json:"upload_id"`
+	FileSize     int64     `json:"file_size"`
+	ChunkSize    int64     `json:"chunk_size"`
+	BytesUploaded int64    `json:"bytes_uploaded"`
+	ChunksUploaded int     `json:"chunks_uploaded"`
+	TotalChunks  int       `json:"total_chunks"`
+	Timestamp    time.Time `json:"timestamp"`
+	Config       *Config   `json:"config,omitempty"`
+}
+
 // EventInfo contains information about upload events
 type EventInfo struct {
 	Event    UploadEvent // Type of event
@@ -77,13 +153,16 @@ type EventInfo struct {
 
 // Config holds options for upload operations.
 type Config struct {
-	ChunkSize    int64                   // Chunk size in bytes (default 10MB)
-	SkipExisting bool                    // Skip files that exist with same size
-	Verbose      bool                    // Enable verbose logging
-	ProgressFunc func(info ProgressInfo) // Progress callback with detailed info
-	EventFunc    func(info EventInfo)    // Event callback for upload lifecycle
-	MaxRetries   int                     // Maximum retry attempts for failed chunks (default 3)
-	BufferPool   *BufferPool             // Optional buffer pool for memory reuse
+	ChunkSize       int64                   // Chunk size in bytes (default 10MB)
+	SkipExisting    bool                    // Skip files that exist with same size
+	Verbose         bool                    // Enable verbose logging
+	ProgressFunc    func(info ProgressInfo) // Progress callback with detailed info
+	EventFunc       func(info EventInfo)    // Event callback for upload lifecycle
+	MaxRetries      int                     // Maximum retry attempts for failed chunks (default 3)
+	BufferPool      *BufferPool             // Optional buffer pool for memory reuse
+	Controller      *UploadController       // Upload controller for pause/resume (optional)
+	CheckpointFunc  func(cp Checkpoint)     // Checkpoint callback for resume functionality
+	ResumeFromCheckpoint *Checkpoint        // Resume from this checkpoint (optional)
 }
 
 // BufferPool manages reusable byte buffers to reduce allocations
@@ -253,12 +332,31 @@ func (c *Client) uploadChunked(localPath, finalPath string, config *Config) erro
 	// Cache filename to avoid repeated path.Base calls
 	filename := filepath.Base(localPath)
 
-	// Prepare upload collection
-	uploadID := c.newUploadID()
-	uploadBase := c.pathJoinMany("uploads", c.username, uploadID)
-
-	if err := c.MkdirAll(uploadBase, 0o755); err != nil && !c.isAlreadyExists(err) {
-		return fmt.Errorf("mkcol %s: %w", uploadBase, err)
+	// Check if resuming from checkpoint
+	var uploadID string
+	var uploadBase string
+	var startOffset int64
+	var sent int64
+	var chunkIndex int
+	
+	if config.ResumeFromCheckpoint != nil {
+		// Resume from checkpoint
+		uploadID = config.ResumeFromCheckpoint.UploadID
+		uploadBase = c.pathJoinMany("uploads", c.username, uploadID)
+		sent = config.ResumeFromCheckpoint.BytesUploaded
+		chunkIndex = config.ResumeFromCheckpoint.ChunksUploaded
+		startOffset = int64(chunkIndex) * config.ChunkSize
+		
+		c.emitEvent(config, EventUploadResumed, filename, finalPath, 
+			fmt.Sprintf("Resuming from chunk %d", chunkIndex), nil)
+	} else {
+		// New upload
+		uploadID = c.newUploadID()
+		uploadBase = c.pathJoinMany("uploads", c.username, uploadID)
+		
+		if err := c.MkdirAll(uploadBase, 0o755); err != nil && !c.isAlreadyExists(err) {
+			return fmt.Errorf("mkcol %s: %w", uploadBase, err)
+		}
 	}
 
 	// Open and get file info
@@ -273,6 +371,14 @@ func (c *Client) uploadChunked(localPath, finalPath string, config *Config) erro
 		return fmt.Errorf("stat %s: %w", localPath, err)
 	}
 	total := fi.Size()
+
+	// Seek to resume position if needed
+	if startOffset > 0 {
+		_, err = f.Seek(startOffset, io.SeekStart)
+		if err != nil {
+			return fmt.Errorf("seek to offset %d: %w", startOffset, err)
+		}
+	}
 
 	// Validate chunk size
 	chunkSize := config.ChunkSize
@@ -290,11 +396,47 @@ func (c *Client) uploadChunked(localPath, finalPath string, config *Config) erro
 		buf = make([]byte, chunkSize)
 	}
 
-	var sent int64
 	totalChunks := calculateChunks(total, chunkSize)
-	chunkIndex := 0
 
-	for offset := int64(0); offset < total; offset += chunkSize {
+	for offset := startOffset; offset < total; offset += chunkSize {
+		// Check for pause/resume/cancel
+		if config.Controller != nil {
+			switch config.Controller.State() {
+			case StatePaused:
+				c.emitEvent(config, EventUploadPaused, filename, finalPath, "Upload paused", nil)
+				
+				// Save checkpoint
+				if config.CheckpointFunc != nil {
+					checkpoint := Checkpoint{
+						LocalPath:      localPath,
+						RemotePath:     finalPath,
+						UploadID:       uploadID,
+						FileSize:       total,
+						ChunkSize:      chunkSize,
+						BytesUploaded:  sent,
+						ChunksUploaded: chunkIndex,
+						TotalChunks:    totalChunks,
+						Timestamp:      time.Now(),
+						Config:         config,
+					}
+					config.CheckpointFunc(checkpoint)
+				}
+				
+				// Wait for resume or cancel
+				select {
+				case <-config.Controller.resumeCh:
+					c.emitEvent(config, EventUploadResumed, filename, finalPath, "Upload resumed", nil)
+				case <-time.After(time.Hour): // Timeout after 1 hour
+					return fmt.Errorf("upload paused timeout")
+				}
+				
+			case StateCancelled:
+				// Cleanup and return
+				_ = c.RemoveAll(uploadBase)
+				return fmt.Errorf("upload cancelled")
+			}
+		}
+
 		want := chunkSize
 		if remain := total - offset; remain < want {
 			want = remain
@@ -355,6 +497,23 @@ func (c *Client) uploadChunked(localPath, finalPath string, config *Config) erro
 			percentage := float64(sent) / float64(total) * 100.0
 			chunkPath := c.pathJoin(uploadBase, strconv.FormatInt(offset, 10))
 			log.Printf("chunk %s: +%d bytes (%d/%d, %.1f%%)", chunkPath, n, sent, total, percentage)
+		}
+
+		// Save checkpoint periodically (every 10 chunks)
+		if config.CheckpointFunc != nil && chunkIndex%10 == 0 {
+			checkpoint := Checkpoint{
+				LocalPath:      localPath,
+				RemotePath:     finalPath,
+				UploadID:       uploadID,
+				FileSize:       total,
+				ChunkSize:      chunkSize,
+				BytesUploaded:  sent,
+				ChunksUploaded: chunkIndex,
+				TotalChunks:    totalChunks,
+				Timestamp:      time.Now(),
+				Config:         config,
+			}
+			config.CheckpointFunc(checkpoint)
 		}
 	}
 
@@ -419,6 +578,67 @@ func (c *Client) validateConfig(config *Config) *Config {
 // calculateChunks returns the number of chunks needed for a file
 func calculateChunks(fileSize, chunkSize int64) int {
 	return int((fileSize + chunkSize - 1) / chunkSize)
+}
+
+// UploadFileResumable uploads a file with built-in pause/resume support
+func (c *Client) UploadFileResumable(localPath, dstPath string, config *Config) (*UploadController, error) {
+	if config == nil {
+		config = DefaultConfig()
+	}
+	
+	// Create upload controller if not provided
+	if config.Controller == nil {
+		config.Controller = NewUploadController()
+	}
+	
+	// Upload in a goroutine to enable pause/resume
+	go func() {
+		err := c.UploadFile(localPath, dstPath, config)
+		if err != nil && config.EventFunc != nil {
+			filename := filepath.Base(localPath)
+			c.emitEvent(config, EventUploadFailed, filename, dstPath, "Upload failed", err)
+		}
+	}()
+	
+	return config.Controller, nil
+}
+
+// ResumeUpload resumes an upload from a checkpoint
+func (c *Client) ResumeUpload(checkpoint Checkpoint, config *Config) error {
+	if config == nil {
+		config = DefaultConfig()
+	}
+	
+	// Set the checkpoint in config
+	config.ResumeFromCheckpoint = &checkpoint
+	
+	return c.UploadFile(checkpoint.LocalPath, checkpoint.RemotePath, config)
+}
+
+// SaveCheckpoint saves a checkpoint to a file (JSON format)
+func SaveCheckpoint(checkpoint Checkpoint, filePath string) error {
+	data, err := json.Marshal(checkpoint)
+	if err != nil {
+		return fmt.Errorf("marshal checkpoint: %w", err)
+	}
+	
+	return os.WriteFile(filePath, data, 0644)
+}
+
+// LoadCheckpoint loads a checkpoint from a file
+func LoadCheckpoint(filePath string) (*Checkpoint, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, fmt.Errorf("read checkpoint file: %w", err)
+	}
+	
+	var checkpoint Checkpoint
+	err = json.Unmarshal(data, &checkpoint)
+	if err != nil {
+		return nil, fmt.Errorf("unmarshal checkpoint: %w", err)
+	}
+	
+	return &checkpoint, nil
 }
 
 // Helper methods
