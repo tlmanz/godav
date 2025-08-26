@@ -3,6 +3,7 @@
 package godav
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log"
@@ -32,12 +33,94 @@ type ProgressInfo struct {
 	TotalChunks int     // Total number of chunks
 }
 
+// UploadEvent represents different stages of the upload process
+type UploadEvent string
+
+const (
+	EventUploadStarted  UploadEvent = "upload_started"  // Upload process initiated
+	EventChunkUploaded  UploadEvent = "chunk_uploaded"  // Individual chunk uploaded
+	EventChunksComplete UploadEvent = "chunks_complete" // All chunks uploaded, before move
+	EventMoveStarted    UploadEvent = "move_started"    // Starting final move operation
+	EventMoveComplete   UploadEvent = "move_complete"   // Move operation completed
+	EventUploadComplete UploadEvent = "upload_complete" // Entire upload process finished
+	EventUploadFailed   UploadEvent = "upload_failed"   // Upload failed
+	EventUploadSkipped  UploadEvent = "upload_skipped"  // File skipped (already exists)
+)
+
+// UploadError represents errors that occur during upload
+type UploadError struct {
+	Op      string // Operation that failed
+	Path    string // File path involved
+	Err     error  // Underlying error
+	Retries int    // Number of retries attempted
+}
+
+func (e *UploadError) Error() string {
+	if e.Retries > 0 {
+		return fmt.Sprintf("%s %s: %v (after %d retries)", e.Op, e.Path, e.Err, e.Retries)
+	}
+	return fmt.Sprintf("%s %s: %v", e.Op, e.Path, e.Err)
+}
+
+func (e *UploadError) Unwrap() error {
+	return e.Err
+}
+
+// EventInfo contains information about upload events
+type EventInfo struct {
+	Event    UploadEvent // Type of event
+	Filename string      // Name of the file
+	Path     string      // Remote path
+	Message  string      // Optional message
+	Error    error       // Error if applicable
+}
+
 // Config holds options for upload operations.
 type Config struct {
 	ChunkSize    int64                   // Chunk size in bytes (default 10MB)
 	SkipExisting bool                    // Skip files that exist with same size
 	Verbose      bool                    // Enable verbose logging
 	ProgressFunc func(info ProgressInfo) // Progress callback with detailed info
+	EventFunc    func(info EventInfo)    // Event callback for upload lifecycle
+	MaxRetries   int                     // Maximum retry attempts for failed chunks (default 3)
+	BufferPool   *BufferPool             // Optional buffer pool for memory reuse
+}
+
+// BufferPool manages reusable byte buffers to reduce allocations
+type BufferPool struct {
+	pool chan []byte
+	size int64
+}
+
+// NewBufferPool creates a new buffer pool with the specified chunk size and pool size
+func NewBufferPool(chunkSize int64, poolSize int) *BufferPool {
+	return &BufferPool{
+		pool: make(chan []byte, poolSize),
+		size: chunkSize,
+	}
+}
+
+// Get retrieves a buffer from the pool or creates a new one
+func (bp *BufferPool) Get() []byte {
+	select {
+	case buf := <-bp.pool:
+		return buf
+	default:
+		return make([]byte, bp.size)
+	}
+}
+
+// Put returns a buffer to the pool for reuse
+func (bp *BufferPool) Put(buf []byte) {
+	if int64(len(buf)) != bp.size {
+		return // Don't pool buffers of wrong size
+	}
+
+	select {
+	case bp.pool <- buf:
+	default:
+		// Pool is full, let GC handle it
+	}
 }
 
 // DefaultConfig returns sensible defaults for upload operations.
@@ -46,6 +129,8 @@ func DefaultConfig() *Config {
 		ChunkSize:    10 * 1024 * 1024, // 10MB
 		SkipExisting: true,
 		Verbose:      false,
+		MaxRetries:   3,
+		BufferPool:   NewBufferPool(10*1024*1024, 4), // Pool of 4 buffers
 	}
 }
 
@@ -66,9 +151,23 @@ func (c *Client) SetVerbose(verbose bool) {
 // UploadFile uploads a single file using Nextcloud's chunked upload protocol.
 // The dstPath is relative to the user's files directory.
 func (c *Client) UploadFile(localPath, dstPath string, config *Config) error {
-	if config == nil {
-		config = DefaultConfig()
+	return c.UploadFileWithContext(context.Background(), localPath, dstPath, config)
+}
+
+// UploadFileWithContext uploads a single file with context support for cancellation.
+func (c *Client) UploadFileWithContext(ctx context.Context, localPath, dstPath string, config *Config) error {
+	config = c.validateConfig(config)
+
+	// Check for cancellation
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	default:
 	}
+
+	// Emit upload started event
+	filename := filepath.Base(localPath)
+	c.emitEvent(config, EventUploadStarted, filename, dstPath, "Upload started", nil)
 
 	// Convert to Nextcloud files path
 	finalPath := c.toFilesPath(dstPath)
@@ -80,6 +179,7 @@ func (c *Client) UploadFile(localPath, dstPath string, config *Config) error {
 				if config.Verbose || c.verbose {
 					log.Printf("Skip unchanged: %s", finalPath)
 				}
+				c.emitEvent(config, EventUploadSkipped, filename, dstPath, "File already exists with same size", nil)
 				return nil
 			}
 		}
@@ -94,14 +194,19 @@ func (c *Client) UploadFile(localPath, dstPath string, config *Config) error {
 		}
 	}
 
-	return c.uploadChunked(localPath, finalPath, config)
+	err := c.uploadChunked(localPath, finalPath, config)
+	if err != nil {
+		c.emitEvent(config, EventUploadFailed, filename, dstPath, "Upload failed", err)
+		return err
+	}
+
+	c.emitEvent(config, EventUploadComplete, filename, dstPath, "Upload completed successfully", nil)
+	return nil
 }
 
 // UploadDir uploads a directory recursively using chunked uploads.
 func (c *Client) UploadDir(localDir, dstDir string, config *Config) error {
-	if config == nil {
-		config = DefaultConfig()
-	}
+	config = c.validateConfig(config)
 
 	return filepath.Walk(localDir, func(localPath string, info os.FileInfo, err error) error {
 		if err != nil {
@@ -145,6 +250,9 @@ func (c *Client) UploadDir(localDir, dstDir string, config *Config) error {
 // 2) PUT /uploads/<user>/<upload-id>/<offset> for each chunk
 // 3) MOVE /uploads/<user>/<upload-id>/.file -> /files/<user>/<dst>
 func (c *Client) uploadChunked(localPath, finalPath string, config *Config) error {
+	// Cache filename to avoid repeated path.Base calls
+	filename := filepath.Base(localPath)
+
 	// Prepare upload collection
 	uploadID := c.newUploadID()
 	uploadBase := c.pathJoinMany("uploads", c.username, uploadID)
@@ -166,42 +274,74 @@ func (c *Client) uploadChunked(localPath, finalPath string, config *Config) erro
 	}
 	total := fi.Size()
 
-	// Upload chunks
+	// Validate chunk size
 	chunkSize := config.ChunkSize
-	if chunkSize <= 0 {
-		chunkSize = 10 * 1024 * 1024
+
+	// Use buffer pool if available, otherwise allocate
+	var buf []byte
+	if config.BufferPool != nil {
+		buf = config.BufferPool.Get()
+		defer config.BufferPool.Put(buf)
+		// Resize buffer if needed
+		if int64(len(buf)) != chunkSize {
+			buf = make([]byte, chunkSize)
+		}
+	} else {
+		buf = make([]byte, chunkSize)
 	}
 
-	buf := make([]byte, int(chunkSize))
 	var sent int64
-	totalChunks := int((total + chunkSize - 1) / chunkSize) // Ceiling division
+	totalChunks := calculateChunks(total, chunkSize)
 	chunkIndex := 0
 
-	for offset := int64(0); offset < total; offset += int64(len(buf)) {
-		want := int64(len(buf))
+	for offset := int64(0); offset < total; offset += chunkSize {
+		want := chunkSize
 		if remain := total - offset; remain < want {
 			want = remain
 		}
 
-		n, rerr := io.ReadFull(f, buf[:int(want)])
+		n, rerr := io.ReadFull(f, buf[:want])
 		if rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
 			return fmt.Errorf("read chunk at %d: %w", offset, rerr)
 		}
 
-		chunkPath := c.pathJoin(uploadBase, strconv.FormatInt(offset, 10))
-		if err := c.Write(chunkPath, buf[:n], 0o644); err != nil {
-			return fmt.Errorf("put chunk %s: %w", chunkPath, err)
+		// Retry logic for chunk upload
+		var uploadErr error
+		for retry := 0; retry <= config.MaxRetries; retry++ {
+			chunkPath := c.pathJoin(uploadBase, strconv.FormatInt(offset, 10))
+			uploadErr = c.Write(chunkPath, buf[:n], 0o644)
+			if uploadErr == nil {
+				break // Success
+			}
+
+			if retry < config.MaxRetries {
+				if config.Verbose || c.verbose {
+					log.Printf("chunk upload retry %d/%d for %s: %v", retry+1, config.MaxRetries, chunkPath, uploadErr)
+				}
+			}
+		}
+
+		if uploadErr != nil {
+			return &UploadError{
+				Op:      "chunk upload",
+				Path:    c.pathJoin(uploadBase, strconv.FormatInt(offset, 10)),
+				Err:     uploadErr,
+				Retries: config.MaxRetries,
+			}
 		}
 
 		sent += int64(n)
 		chunkIndex++
 
-		// Call progress callbacks if provided
-		percentage := float64(sent) / float64(total) * 100.0
+		// Emit chunk uploaded event
+		c.emitEvent(config, EventChunkUploaded, filename, finalPath,
+			fmt.Sprintf("Chunk %d/%d uploaded", chunkIndex, totalChunks), nil)
 
+		// Call progress callbacks if provided
 		if config.ProgressFunc != nil {
+			percentage := float64(sent) / float64(total) * 100.0
 			info := ProgressInfo{
-				Filename:    filepath.Base(localPath),
+				Filename:    filename,
 				Current:     sent,
 				Total:       total,
 				Percentage:  percentage,
@@ -212,11 +352,17 @@ func (c *Client) uploadChunked(localPath, finalPath string, config *Config) erro
 		}
 
 		if config.Verbose || c.verbose {
+			percentage := float64(sent) / float64(total) * 100.0
+			chunkPath := c.pathJoin(uploadBase, strconv.FormatInt(offset, 10))
 			log.Printf("chunk %s: +%d bytes (%d/%d, %.1f%%)", chunkPath, n, sent, total, percentage)
 		}
 	}
 
+	// All chunks uploaded
+	c.emitEvent(config, EventChunksComplete, filename, finalPath, "All chunks uploaded", nil)
+
 	// Finalize: MOVE to final destination
+	c.emitEvent(config, EventMoveStarted, filename, finalPath, "Starting final move operation", nil)
 	c.SetHeader("OC-Total-Length", strconv.FormatInt(total, 10))
 	defer c.SetHeader("OC-Total-Length", "")
 
@@ -226,6 +372,8 @@ func (c *Client) uploadChunked(localPath, finalPath string, config *Config) erro
 		return fmt.Errorf("finalize move %s -> %s: %w", src, finalPath, err)
 	}
 
+	c.emitEvent(config, EventMoveComplete, filename, finalPath, "Move operation completed", nil)
+
 	// Cleanup
 	_ = c.RemoveAll(uploadBase)
 
@@ -234,6 +382,43 @@ func (c *Client) uploadChunked(localPath, finalPath string, config *Config) erro
 	}
 
 	return nil
+}
+
+// validateConfig validates and sanitizes the configuration
+func (c *Client) validateConfig(config *Config) *Config {
+	if config == nil {
+		return DefaultConfig()
+	}
+
+	// Ensure chunk size is reasonable
+	if config.ChunkSize <= 0 {
+		config.ChunkSize = 10 * 1024 * 1024 // 10MB default
+	}
+
+	// Minimum chunk size of 1KB to avoid excessive requests
+	if config.ChunkSize < 1024 {
+		config.ChunkSize = 1024
+	}
+
+	// Maximum chunk size of 1GB to avoid memory issues
+	if config.ChunkSize > 1024*1024*1024 {
+		config.ChunkSize = 1024 * 1024 * 1024
+	}
+
+	// Ensure max retries is reasonable
+	if config.MaxRetries < 0 {
+		config.MaxRetries = 0
+	}
+	if config.MaxRetries > 10 {
+		config.MaxRetries = 10 // Cap at 10 retries
+	}
+
+	return config
+}
+
+// calculateChunks returns the number of chunks needed for a file
+func calculateChunks(fileSize, chunkSize int64) int {
+	return int((fileSize + chunkSize - 1) / chunkSize)
 }
 
 // Helper methods
@@ -293,4 +478,18 @@ func (c *Client) isAlreadyExists(err error) bool {
 
 func (c *Client) newUploadID() string {
 	return fmt.Sprintf("web-file-upload-%d", time.Now().UnixNano())
+}
+
+// emitEvent calls the event callback if configured
+func (c *Client) emitEvent(config *Config, event UploadEvent, filename, path, message string, err error) {
+	if config.EventFunc != nil {
+		info := EventInfo{
+			Event:    event,
+			Filename: filename,
+			Path:     path,
+			Message:  message,
+			Error:    err,
+		}
+		config.EventFunc(info)
+	}
 }
