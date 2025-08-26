@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
 	"github.com/tlmanz/godav"
@@ -44,7 +45,7 @@ func basicUploadExample() {
 	}
 
 	// Basic upload
-	if err := client.UploadFile("test.txt", "/remote/path/test.txt", config); err != nil {
+	if err := client.UploadFile("/path/to/local/file.txt", "remote/path/file.txt", config); err != nil {
 		var uploadErr *godav.UploadError
 		if errors.As(err, &uploadErr) {
 			fmt.Printf("Upload error: %v\n", uploadErr.Err)
@@ -56,7 +57,7 @@ func basicUploadExample() {
 
 func pauseResumeExample() {
 	fmt.Println("\n=== Pause/Resume Upload Example ===")
-	client := godav.NewClient("https://nextcloud.example.com/remote.php/dav/", "username", "password")
+	client := godav.NewClient("https://storage.slt.lk/drive/remote.php/dav/", "4a029cf7-4193-4907-bf6c-5371f4b74e9f", "Yaz59-7fCp3-cBMk7-rTygp-ybsgc")
 	config := godav.DefaultConfig()
 	config.Verbose = true
 
@@ -91,37 +92,45 @@ func pauseResumeExample() {
 			fmt.Printf("▶️ Upload resumed: %s\n", info.Filename)
 		case godav.EventUploadComplete:
 			fmt.Printf("✅ Upload complete: %s\n", info.Filename)
+		case godav.EventUploadFailed:
+			fmt.Printf("❌ Upload failed: %s - %v\n", info.Filename, info.Error)
 		}
 	}
 
-	// Check for existing checkpoint
+	// Check for existing checkpoint first
 	if checkpoint, err := godav.LoadCheckpoint(checkpointFile); err == nil {
-		fmt.Printf("📄 Found checkpoint, resuming upload...\n")
+		fmt.Printf("📄 Found checkpoint, resuming upload from %d/%d bytes...\n",
+			checkpoint.BytesUploaded, checkpoint.FileSize)
 		if err := client.ResumeUpload(*checkpoint, config); err != nil {
 			fmt.Printf("Error resuming upload: %v\n", err)
+		} else {
+			// Clean up checkpoint on successful resume
+			os.Remove(checkpointFile)
 		}
-	} else {
-		// Start new upload
-		controller, err := client.UploadFileResumable("large_file.zip", "/remote/path/large_file.zip", config)
-		if err != nil {
-			fmt.Printf("Error starting resumable upload: %v\n", err)
-			return
-		}
+		return
+	}
 
+	// Start new upload with pause/resume capability
+	go func() {
 		// Simulate pausing after 2 seconds
-		go func() {
-			time.Sleep(2 * time.Second)
-			fmt.Println("⏸️ Pausing upload...")
-			controller.Pause()
+		time.Sleep(2 * time.Second)
+		fmt.Println("🛑 Pausing upload...")
+		controller.Pause()
 
-			// Resume after 3 seconds
-			time.Sleep(3 * time.Second)
-			fmt.Println("▶️ Resuming upload...")
-			controller.Resume()
-		}()
+		// Resume after 3 seconds
+		time.Sleep(3 * time.Second)
+		fmt.Println("▶️ Resuming upload...")
+		controller.Resume()
+	}()
 
-		// Monitor upload state (simplified for demo)
-		time.Sleep(10 * time.Second)
+	// Start the upload
+	if err := client.UploadFile("/home/tharuka/Desktop/Personal/gowebdav/test/test.mkv", "Movies/movie.mkv", config); err != nil {
+		fmt.Printf("Upload failed: %v\n", err)
+		fmt.Println("📄 Checkpoint saved. You can resume this upload later by running the example again.")
+	} else {
+		// Clean up checkpoint file on success
+		os.Remove(checkpointFile)
+		fmt.Println("🧹 Checkpoint file cleaned up")
 	}
 }
 
@@ -144,9 +153,19 @@ func timeoutExample() {
 }
 
 func main() {
-	basicUploadExample()
-	pauseResumeExample()
-	timeoutExample()
+	fmt.Println("🚀 godav Examples")
+	fmt.Println("================")
 
-	fmt.Println("Done!")
+	// Uncomment the example you want to run:
+
+	// Example 1: Basic upload with progress and events
+	// basicUploadExample()
+
+	// Example 2: Pause/Resume upload with checkpoints
+	pauseResumeExample()
+
+	// Example 3: Upload with timeout
+	// timeoutExample()
+
+	fmt.Println("\n✅ Example completed!")
 }
