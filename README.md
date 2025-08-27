@@ -9,19 +9,6 @@
 
 🚀 A Go library for WebDAV with full support for Nextcloud chunked uploads and advanced file operations.
 
-## Architecture
-
-The library is organized into focused modules for better maintainability and clarity:
-
-- **`client.go`** - Core client functionality and basic upload methods
-- **`types.go`** - Type definitions, constants, and configuration structures  
-- **`chunked_upload.go`** - Chunked upload implementation with retry logic
-- **`upload_controller.go`** - Pause/resume/cancel functionality for uploads
-- **`upload_manager.go`** - Multi-session upload coordination and management
-- **`checkpoint.go`** - Upload resumption and checkpoint persistence
-- **`buffer_pool.go`** - Memory-efficient buffer management
-- **`utils.go`** - Helper functions and utilities
-
 ## Features
 
 - High-level client for Nextcloud WebDAV
