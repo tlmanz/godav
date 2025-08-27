@@ -29,9 +29,11 @@ package godav
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"path/filepath"
+	"sync"
 
 	gowebdav "github.com/studio-b12/gowebdav"
 )
@@ -43,6 +45,7 @@ type Client struct {
 	*gowebdav.Client
 	username string
 	config   *Config
+	hdrMu    sync.Mutex
 }
 
 // NewClient creates a new Nextcloud WebDAV client.
@@ -171,8 +174,12 @@ func (c *Client) uploadFileCore(ctx context.Context, localPath, dstPath string) 
 	filename := filepath.Base(localPath)
 	c.emitEvent(EventUploadStarted, filename, dstPath, "Upload started", nil)
 
-	// Convert to Nextcloud files path
-	finalPath := c.toFilesPath(dstPath)
+	// Convert to Nextcloud files path and validate
+	cleaned := c.sanitizeRemotePath(dstPath)
+	if cleaned == "" {
+		return fmt.Errorf("invalid remote path")
+	}
+	finalPath := c.pathJoinMany("files", c.username, cleaned)
 
 	// Skip if exists with same size
 	if c.config.SkipExisting {

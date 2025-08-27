@@ -42,6 +42,8 @@ The library is organized into focused modules for better maintainability and cla
   - Resume from interruptions or failures
   - Graceful handling of network disconnections
 	- Multi-session coordination via UploadManager (pause/resume all or individual sessions)
+  
+- Full gowebdav support: `godav.Client` embeds `*gowebdav.Client`, so you can use all features from the underlying WebDAV client (ReadDir, Stat, Write, Remove, MkdirAll, etc.). See https://github.com/studio-b12/gowebdav.
 
 ## Installation
 
@@ -81,6 +83,29 @@ func main() {
 	}
 }
 ```
+
+### Using other WebDAV features (via gowebdav)
+
+`godav.Client` embeds `*gowebdav.Client`, so you can call all methods from the underlying library for general WebDAV operations (listing, stat, delete, etc.). Paths should be relative to your DAV base URL. For user files in Nextcloud, prefix paths with `files/<username>/`.
+
+```go
+// Given: client := godav.NewClient("https://nextcloud.example.com/remote.php/dav/", "alice", "app-password")
+
+// List a directory under the user's files
+entries, err := client.ReadDir("files/alice/Photos")
+if err != nil { /* handle */ }
+
+// Stat a file
+info, err := client.Stat("files/alice/Photos/pic.jpg")
+
+// Create a directory (recursively)
+err = client.MkdirAll("files/alice/NewFolder", 0o755)
+
+// Remove a file
+err = client.Remove("files/alice/Old/pic.jpg")
+```
+
+For the full API surface, see gowebdav: https://github.com/studio-b12/gowebdav
 
 ### Advanced Usage with All Features
 

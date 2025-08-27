@@ -134,10 +134,12 @@ func (c *Client) uploadChunked(ctx context.Context, localPath, finalPath string)
 					c.config.CheckpointFunc(checkpoint)
 				}
 
-				// Wait for resume or cancel
+				// Wait for resume or cancel or context done
 				select {
 				case <-c.config.Controller.resumeCh:
 					c.emitEvent(EventUploadResumed, filename, finalPath, "Upload resumed", nil)
+				case <-ctx.Done():
+					return ctx.Err()
 				case <-time.After(time.Hour): // Timeout after 1 hour
 					return fmt.Errorf("upload paused timeout")
 				}
@@ -248,8 +250,13 @@ func (c *Client) uploadChunked(ctx context.Context, localPath, finalPath string)
 
 	// Finalize: MOVE to final destination
 	c.emitEvent(EventMoveStarted, filename, finalPath, "Starting final move operation", nil)
+	// guard header mutation and rename in case same underlying client is shared
+	c.hdrMu.Lock()
 	c.SetHeader("OC-Total-Length", strconv.FormatInt(total, 10))
-	defer c.SetHeader("OC-Total-Length", "")
+	defer func() {
+		c.SetHeader("OC-Total-Length", "")
+		c.hdrMu.Unlock()
+	}()
 
 	src := c.pathJoin(uploadBase, ".file")
 	// Check context before final MOVE

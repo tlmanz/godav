@@ -14,18 +14,42 @@ package godav
 
 import (
 	"fmt"
+	"path"
 	"strings"
 	"time"
 )
 
 // Helper methods
 
-func (c *Client) toFilesPath(dstPath string) string {
-	dstPath = strings.TrimPrefix(dstPath, "/")
-	if strings.HasPrefix(dstPath, "files/") {
-		return strings.TrimPrefix(dstPath, "/")
+// sanitizeRemotePath cleans a user-provided remote path and prevents traversal.
+// It rejects any path containing ".." segments after cleaning.
+func (c *Client) sanitizeRemotePath(p string) string {
+	p = strings.TrimSpace(p)
+	p = strings.TrimPrefix(p, "/")
+	// If user passed a full files/.. path, strip the leading files/<anything>/ prefix.
+	if strings.HasPrefix(p, "files/") {
+		parts := strings.Split(p, "/")
+		// drop first two segments if available (files/<user>), keep rest
+		if len(parts) >= 3 {
+			p = strings.Join(parts[2:], "/")
+		} else {
+			p = ""
+		}
 	}
-	return c.pathJoinMany("files", c.username, dstPath)
+	// Clean to collapse any ./ or ../ segments
+	cleaned := path.Clean("/" + p) // ensure absolute for Clean semantics
+	cleaned = strings.TrimPrefix(cleaned, "/")
+	// Reject traversal
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.Contains(cleaned, "/../") {
+		// Drop to empty to avoid writing outside user's files root
+		cleaned = ""
+	}
+	return cleaned
+}
+
+func (c *Client) toFilesPath(dstPath string) string {
+	dst := c.sanitizeRemotePath(dstPath)
+	return c.pathJoinMany("files", c.username, dst)
 }
 
 func (c *Client) pathJoin(a, b string) string {
@@ -124,6 +148,14 @@ func (c *Client) validateConfig() *Config {
 	}
 	if c.config.MaxRetries > 10 {
 		c.config.MaxRetries = 10 // Cap at 10 retries
+	}
+
+	// Ensure buffer pool (if provided) matches chunk size to avoid reallocation churn
+	if c.config.BufferPool != nil {
+		if c.config.BufferPool.size != c.config.ChunkSize {
+			// Recreate a matching pool with a small default size
+			c.config.BufferPool = NewBufferPool(c.config.ChunkSize, 4)
+		}
 	}
 
 	return c.config

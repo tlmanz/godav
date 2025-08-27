@@ -92,7 +92,9 @@ func (um *UploadManager) AddUploadSession(localPath, remotePath string, client *
 	if client.config == nil {
 		client.config = DefaultConfig()
 	}
-	client.config.Controller = controller
+	// Clone client.config per session so callbacks and controller are isolated
+	sessCfg := *client.config
+	sessCfg.Controller = controller
 
 	session := &UploadSession{
 		ID:         sessionID,
@@ -100,6 +102,7 @@ func (um *UploadManager) AddUploadSession(localPath, remotePath string, client *
 		RemotePath: remotePath,
 		Client:     client,
 		Controller: controller,
+		Config:     &sessCfg,
 		Status:     StatusQueued,
 		CreatedAt:  time.Now(),
 		UpdatedAt:  time.Now(),
@@ -127,17 +130,17 @@ func (um *UploadManager) StartUpload(sessionID string) error {
 	session.UpdatedAt = time.Now()
 
 	// Start upload in goroutine
-	go func() {
-		err := session.Client.UploadFile(session.LocalPath, session.RemotePath)
+	go func(sess *UploadSession) {
+		err := sess.Client.UploadFileWithConfig(sess.LocalPath, sess.RemotePath, sess.Config)
 		um.mu.Lock()
 		if err != nil {
-			session.Status = StatusFailed
+			sess.Status = StatusFailed
 		} else {
-			session.Status = StatusCompleted
+			sess.Status = StatusCompleted
 		}
-		session.UpdatedAt = time.Now()
+		sess.UpdatedAt = time.Now()
 		um.mu.Unlock()
-	}()
+	}(session)
 
 	return nil
 }

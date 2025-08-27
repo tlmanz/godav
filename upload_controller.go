@@ -27,6 +27,7 @@ type UploadController struct {
 	pauseCh   chan struct{}
 	resumeCh  chan struct{}
 	manager   *UploadManager
+	mu        sync.RWMutex
 }
 
 // NewUploadController creates a new upload controller for a specific session
@@ -54,6 +55,8 @@ func NewSimpleUploadController() *UploadController {
 
 // Pause pauses the upload
 func (uc *UploadController) Pause() {
+	uc.mu.Lock()
+	defer uc.mu.Unlock()
 	if uc.state == StateRunning {
 		uc.state = StatePaused
 		select {
@@ -65,6 +68,8 @@ func (uc *UploadController) Pause() {
 
 // Resume resumes the upload
 func (uc *UploadController) Resume() {
+	uc.mu.Lock()
+	defer uc.mu.Unlock()
 	if uc.state == StatePaused {
 		uc.state = StateRunning
 		select {
@@ -76,10 +81,14 @@ func (uc *UploadController) Resume() {
 
 // Cancel cancels the upload
 func (uc *UploadController) Cancel() {
+	uc.mu.Lock()
 	uc.state = StateCancelled
+	uc.mu.Unlock()
 }
 
 // State returns the current upload state
 func (uc *UploadController) State() UploadState {
+	uc.mu.RLock()
+	defer uc.mu.RUnlock()
 	return uc.state
 }
