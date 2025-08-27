@@ -40,6 +40,7 @@ The library is organized into focused modules for better maintainability and cla
   - Automatic checkpoint saving and loading
   - Resume from interruptions or failures
   - Graceful handling of network disconnections
+	- Multi-session coordination via UploadManager (pause/resume all or individual sessions)
 
 ## Installation
 
@@ -175,6 +176,89 @@ func main() {
 	// ... your app continues while the upload runs in background
 }
 ```
+
+### Upload Manager: Multi-session with Configs
+
+Coordinate multiple uploads with shared or per-client configs and pause/resume controls.
+
+```go
+package main
+
+import (
+	"fmt"
+	"log"
+	"time"
+	"github.com/tlmanz/godav"
+)
+
+func main() {
+	// Create clients (can point to same or different servers)
+	client1 := godav.NewClient("https://nc.example.com/remote.php/dav/", "user1", "pass1")
+	client2 := godav.NewClient("https://nc.example.com/remote.php/dav/", "user2", "pass2")
+
+	// Set per-client default configs used by the manager
+	cfg1 := godav.DefaultConfig()
+	cfg1.Verbose = true
+	cfg1.MaxRetries = 5
+	cfg1.ProgressFunc = func(p godav.ProgressInfo) {
+		fmt.Printf("[C1 %s] %.1f%%\n", p.SessionID, p.Percentage)
+	}
+	client1.SetConfig(cfg1)
+
+	cfg2 := godav.DefaultConfig()
+	cfg2.ChunkSize = 20 * 1024 * 1024 // 20MB
+	cfg2.EventFunc = func(e godav.EventInfo) {
+		if e.Event == godav.EventUploadComplete {
+			fmt.Printf("[C2 %s] completed %s\n", e.SessionID, e.Filename)
+		}
+	}
+	client2.SetConfig(cfg2)
+
+	// Create manager
+	manager := godav.NewUploadManager()
+
+	// Add sessions (manager wires a controller into the client's config)
+	s1, err := manager.AddUploadSession("/path/movie1.mkv", "Videos/movie1.mkv", client1)
+	if err != nil { log.Fatal(err) }
+
+	s2, err := manager.AddUploadSession("/path/photos.zip", "Backups/photos.zip", client2)
+	if err != nil { log.Fatal(err) }
+
+	// Start them
+	if err := manager.StartUpload(s1.ID); err != nil { log.Fatal(err) }
+	if err := manager.StartUpload(s2.ID); err != nil { log.Fatal(err) }
+
+	// Demonstrate pause/resume (individual and global)
+	time.Sleep(5 * time.Second)
+	_ = manager.PauseUpload(s1.ID)
+	time.Sleep(2 * time.Second)
+	_ = manager.ResumeUpload(s1.ID)
+
+	// Pause all
+	manager.PauseAllUploads()
+	time.Sleep(2 * time.Second)
+	manager.ResumeAllUploads()
+
+	// Poll status (simple loop; in real apps, use events and UI)
+	for {
+		sessions := manager.GetUploadSessions()
+		done := true
+		for _, sess := range sessions {
+			if sess.Status != godav.StatusCompleted && sess.Status != godav.StatusFailed && sess.Status != godav.StatusCancelled {
+				done = false
+				break
+			}
+		}
+		if done { break }
+		time.Sleep(1 * time.Second)
+	}
+}
+```
+
+Notes:
+- Manager uses each client’s current config (set via `client.SetConfig`) and injects a session-specific `UploadController` enabling pause/resume.
+- Use `ProgressFunc` and `EventFunc` in the client’s config to observe per-session `SessionID` values for UI updates.
+- For resumable uploads across restarts, pair manager flows with `CheckpointFunc` to persist progress; resume with `client.ResumeUpload` or by configuring `ResumeFromCheckpoint` and calling an upload.
 
 ## Configuration
 

@@ -72,6 +72,15 @@ func (c *Client) SetVerbose(verbose bool) {
 	c.config.Verbose = verbose
 }
 
+// SetConfig replaces the client's default configuration used by methods that
+// do not take an explicit config parameter (e.g., UploadFile, UploadDir, UploadManager flows).
+// The provided config is validated and sanitized.
+// Not safe to change concurrently with ongoing uploads on the same client.
+func (c *Client) SetConfig(cfg *Config) {
+	c.config = cfg
+	c.config = c.validateConfig()
+}
+
 // UploadFile uploads a single file using Nextcloud's chunked upload protocol.
 // The dstPath is relative to the user's files directory.
 //
