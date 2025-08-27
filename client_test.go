@@ -40,7 +40,7 @@ func TestNewClient(t *testing.T) {
 func TestSetVerbose(t *testing.T) {
 	c := NewClient("http://example.com", "user", "pass")
 	c.SetVerbose(true)
-	if !c.verbose {
+	if !c.config.Verbose {
 		t.Error("expected verbose to be true")
 	}
 }
@@ -308,15 +308,13 @@ func TestEmitEvent(t *testing.T) {
 	eventCalled := false
 	var capturedEvent EventInfo
 
-	config := &Config{
-		EventFunc: func(info EventInfo) {
-			eventCalled = true
-			capturedEvent = info
-		},
+	c.config.EventFunc = func(info EventInfo) {
+		eventCalled = true
+		capturedEvent = info
 	}
 
 	// Test emitting an event
-	c.emitEvent(config, EventUploadStarted, "test.txt", "remote/test.txt", "Test message", nil)
+	c.emitEvent(EventUploadStarted, "test.txt", "remote/test.txt", "Test message", nil)
 
 	if !eventCalled {
 		t.Error("expected event to be emitted")
@@ -335,12 +333,10 @@ func TestEmitEvent(t *testing.T) {
 func TestEmitEventWithNilConfig(t *testing.T) {
 	c := NewClient("http://example.com", "user", "pass")
 
-	config := &Config{
-		EventFunc: nil, // No event function configured
-	}
+	c.config.EventFunc = nil
 
 	// This should not panic
-	c.emitEvent(config, EventUploadStarted, "test.txt", "remote/test.txt", "Test message", nil)
+	c.emitEvent(EventUploadStarted, "test.txt", "remote/test.txt", "Test message", nil)
 }
 
 func TestUploadEvents(t *testing.T) {
@@ -468,7 +464,9 @@ func TestValidateConfig(t *testing.T) {
 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			result := c.validateConfig(test.input)
+			// Apply test input config (may be nil) before validation
+			c.config = test.input
+			result := c.validateConfig()
 			if !test.expected(result) {
 				t.Errorf("validation failed for %s", test.name)
 			}
@@ -540,7 +538,7 @@ func TestContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	err := c.UploadFileWithContext(ctx, "/nonexistent", "remote", nil)
+	err := c.UploadFileWithContext(ctx, "/nonexistent", "remote")
 	if err == nil {
 		t.Error("expected error from cancelled context")
 	}
@@ -560,25 +558,26 @@ func TestDefaultConfigWithBufferPool(t *testing.T) {
 }
 
 func TestUploadController(t *testing.T) {
-	controller := NewUploadController()
-	
+	manager := NewUploadManager()
+	controller := NewUploadController("test-controller", manager)
+
 	// Test initial state
 	if controller.State() != StateRunning {
 		t.Errorf("expected initial state to be StateRunning, got %v", controller.State())
 	}
-	
+
 	// Test pause
 	controller.Pause()
 	if controller.State() != StatePaused {
 		t.Errorf("expected state to be StatePaused after pause, got %v", controller.State())
 	}
-	
+
 	// Test resume
 	controller.Resume()
 	if controller.State() != StateRunning {
 		t.Errorf("expected state to be StateRunning after resume, got %v", controller.State())
 	}
-	
+
 	// Test cancel
 	controller.Cancel()
 	if controller.State() != StateCancelled {
@@ -598,7 +597,7 @@ func TestCheckpoint(t *testing.T) {
 		TotalChunks:    1000,
 		Timestamp:      time.Now(),
 	}
-	
+
 	// Test checkpoint fields
 	if checkpoint.LocalPath != "/path/to/local/file.txt" {
 		t.Errorf("unexpected LocalPath: %s", checkpoint.LocalPath)
@@ -623,23 +622,23 @@ func TestSaveAndLoadCheckpoint(t *testing.T) {
 		TotalChunks:    10,
 		Timestamp:      time.Now().Truncate(time.Second), // Truncate for comparison
 	}
-	
+
 	// Create temp file
 	tmpFile := "/tmp/test_checkpoint.json"
 	defer os.Remove(tmpFile)
-	
+
 	// Save checkpoint
 	err := SaveCheckpoint(checkpoint, tmpFile)
 	if err != nil {
 		t.Fatalf("failed to save checkpoint: %v", err)
 	}
-	
+
 	// Load checkpoint
 	loaded, err := LoadCheckpoint(tmpFile)
 	if err != nil {
 		t.Fatalf("failed to load checkpoint: %v", err)
 	}
-	
+
 	// Compare
 	if loaded.LocalPath != checkpoint.LocalPath {
 		t.Errorf("LocalPath mismatch: %s != %s", loaded.LocalPath, checkpoint.LocalPath)
@@ -654,10 +653,9 @@ func TestSaveAndLoadCheckpoint(t *testing.T) {
 
 func TestUploadFileResumable(t *testing.T) {
 	c := NewClient("http://example.com", "user", "pass")
-	config := DefaultConfig()
-	
+
 	// Test that controller is created
-	controller, err := c.UploadFileResumable("/nonexistent", "remote", config)
+	controller, err := c.UploadFileResumable("/nonexistent", "remote")
 	if err != nil {
 		t.Errorf("unexpected error: %v", err)
 	}
@@ -674,15 +672,493 @@ func TestNewPauseResumeEvents(t *testing.T) {
 		EventUploadPaused,
 		EventUploadResumed,
 	}
-	
+
 	expectedEvents := []string{
 		"upload_paused",
 		"upload_resumed",
 	}
-	
+
 	for i, event := range events {
 		if string(event) != expectedEvents[i] {
 			t.Errorf("expected event %s, got %s", expectedEvents[i], string(event))
 		}
+	}
+}
+
+// Tests for Multi-Client Upload Management
+
+func TestNewUploadManager(t *testing.T) {
+	manager := NewUploadManager()
+	if manager == nil {
+		t.Fatal("expected NewUploadManager to return a non-nil manager")
+	}
+
+	if manager.sessions == nil {
+		t.Error("expected sessions map to be initialized")
+	}
+
+	if manager.globalCtrl == nil {
+		t.Error("expected global controller to be initialized")
+	}
+
+	if manager.IsGloballyPaused() {
+		t.Error("expected new manager to not be globally paused")
+	}
+}
+
+func TestUploadManager_AddUploadSession(t *testing.T) {
+	manager := NewUploadManager()
+	client := NewClient("http://example.com", "user", "pass")
+
+	session, err := manager.AddUploadSession("/local/test.txt", "/remote/test.txt", client)
+	if err != nil {
+		t.Fatalf("unexpected error adding session: %v", err)
+	}
+
+	if session == nil {
+		t.Fatal("expected session to be non-nil")
+	}
+
+	if session.ID == "" {
+		t.Error("expected session to have an ID")
+	}
+
+	if session.LocalPath != "/local/test.txt" {
+		t.Errorf("expected LocalPath '/local/test.txt', got '%s'", session.LocalPath)
+	}
+
+	if session.RemotePath != "/remote/test.txt" {
+		t.Errorf("expected RemotePath '/remote/test.txt', got '%s'", session.RemotePath)
+	}
+
+	if session.Status != StatusQueued {
+		t.Errorf("expected initial status StatusQueued, got %v", session.Status)
+	}
+
+	if session.Controller == nil {
+		t.Error("expected session to have a controller")
+	}
+
+	if session.Controller.sessionID != session.ID {
+		t.Error("expected controller sessionID to match session ID")
+	}
+
+	// Check that session is stored in manager
+	sessions := manager.GetUploadSessions()
+	if len(sessions) != 1 {
+		t.Errorf("expected 1 session in manager, got %d", len(sessions))
+	}
+
+	if _, exists := sessions[session.ID]; !exists {
+		t.Error("expected session to be stored in manager")
+	}
+}
+
+func TestUploadManager_GetUploadSession(t *testing.T) {
+	manager := NewUploadManager()
+	client := NewClient("http://example.com", "user", "pass")
+
+	// Add a session
+	session, err := manager.AddUploadSession("/local/test.txt", "/remote/test.txt", client)
+	if err != nil {
+		t.Fatalf("unexpected error adding session: %v", err)
+	}
+
+	// Retrieve the session
+	retrieved, err := manager.GetUploadSession(session.ID)
+	if err != nil {
+		t.Fatalf("unexpected error getting session: %v", err)
+	}
+
+	if retrieved.ID != session.ID {
+		t.Errorf("expected session ID '%s', got '%s'", session.ID, retrieved.ID)
+	}
+
+	// Test non-existent session
+	_, err = manager.GetUploadSession("non-existent")
+	if err == nil {
+		t.Error("expected error for non-existent session")
+	}
+}
+
+func TestUploadManager_PauseResumeUpload(t *testing.T) {
+	manager := NewUploadManager()
+	client := NewClient("http://example.com", "user", "pass")
+
+	// Add a session
+	session, err := manager.AddUploadSession("/local/test.txt", "/remote/test.txt", client)
+	if err != nil {
+		t.Fatalf("unexpected error adding session: %v", err)
+	}
+
+	// Start the upload (change status to running)
+	session.Status = StatusRunning
+	manager.sessions[session.ID] = session
+
+	// Test pause
+	err = manager.PauseUpload(session.ID)
+	if err != nil {
+		t.Fatalf("unexpected error pausing upload: %v", err)
+	}
+
+	updatedSession, _ := manager.GetUploadSession(session.ID)
+	if updatedSession.Status != StatusPaused {
+		t.Errorf("expected status StatusPaused after pause, got %v", updatedSession.Status)
+	}
+
+	// Test resume
+	err = manager.ResumeUpload(session.ID)
+	if err != nil {
+		t.Fatalf("unexpected error resuming upload: %v", err)
+	}
+
+	updatedSession, _ = manager.GetUploadSession(session.ID)
+	if updatedSession.Status != StatusRunning {
+		t.Errorf("expected status StatusRunning after resume, got %v", updatedSession.Status)
+	}
+
+	// Test pause non-running session
+	session.Status = StatusCompleted
+	manager.sessions[session.ID] = session
+
+	err = manager.PauseUpload(session.ID)
+	if err == nil {
+		t.Error("expected error when pausing non-running session")
+	}
+
+	// Test resume non-paused session
+	err = manager.ResumeUpload(session.ID)
+	if err == nil {
+		t.Error("expected error when resuming non-paused session")
+	}
+}
+
+func TestUploadManager_PauseResumeAll(t *testing.T) {
+	manager := NewUploadManager()
+	client := NewClient("http://example.com", "user", "pass")
+
+	// Add multiple sessions
+	sessions := make([]*UploadSession, 3)
+	for i := 0; i < 3; i++ {
+		session, err := manager.AddUploadSession(
+			fmt.Sprintf("/local/test%d.txt", i),
+			fmt.Sprintf("/remote/test%d.txt", i),
+			client)
+		if err != nil {
+			t.Fatalf("unexpected error adding session %d: %v", i, err)
+		}
+		// Set them as running
+		session.Status = StatusRunning
+		manager.sessions[session.ID] = session
+		sessions[i] = session
+	}
+
+	// Test pause all
+	manager.PauseAllUploads()
+
+	if !manager.IsGloballyPaused() {
+		t.Error("expected manager to be globally paused")
+	}
+
+	allSessions := manager.GetUploadSessions()
+	for _, session := range allSessions {
+		if session.Status != StatusPaused {
+			t.Errorf("expected session %s to be paused, got %v", session.ID, session.Status)
+		}
+	}
+
+	// Test resume all
+	manager.ResumeAllUploads()
+
+	if manager.IsGloballyPaused() {
+		t.Error("expected manager to not be globally paused after resume")
+	}
+
+	allSessions = manager.GetUploadSessions()
+	for _, session := range allSessions {
+		if session.Status != StatusRunning {
+			t.Errorf("expected session %s to be running, got %v", session.ID, session.Status)
+		}
+	}
+}
+
+func TestUploadManager_RemoveUploadSession(t *testing.T) {
+	manager := NewUploadManager()
+	client := NewClient("http://example.com", "user", "pass")
+
+	// Add a session
+	session, err := manager.AddUploadSession("/local/test.txt", "/remote/test.txt", client)
+	if err != nil {
+		t.Fatalf("unexpected error adding session: %v", err)
+	}
+
+	// Try to remove running session (should fail)
+	session.Status = StatusRunning
+	manager.sessions[session.ID] = session
+
+	err = manager.RemoveUploadSession(session.ID)
+	if err == nil {
+		t.Error("expected error when removing running session")
+	}
+
+	// Complete the session and remove it
+	session.Status = StatusCompleted
+	manager.sessions[session.ID] = session
+
+	err = manager.RemoveUploadSession(session.ID)
+	if err != nil {
+		t.Fatalf("unexpected error removing completed session: %v", err)
+	}
+
+	// Verify it's removed
+	sessions := manager.GetUploadSessions()
+	if len(sessions) != 0 {
+		t.Errorf("expected 0 sessions after removal, got %d", len(sessions))
+	}
+
+	// Try to remove non-existent session
+	err = manager.RemoveUploadSession("non-existent")
+	if err == nil {
+		t.Error("expected error when removing non-existent session")
+	}
+}
+
+func TestUploadController_WithSessionID(t *testing.T) {
+	manager := NewUploadManager()
+	sessionID := "test-session-123"
+
+	controller := NewUploadController(sessionID, manager)
+	if controller == nil {
+		t.Fatal("expected NewUploadController to return non-nil controller")
+	}
+
+	if controller.sessionID != sessionID {
+		t.Errorf("expected sessionID '%s', got '%s'", sessionID, controller.sessionID)
+	}
+
+	if controller.manager != manager {
+		t.Error("expected controller to reference the manager")
+	}
+
+	if controller.State() != StateRunning {
+		t.Errorf("expected initial state StateRunning, got %v", controller.State())
+	}
+}
+
+func TestUploadController_PauseResume(t *testing.T) {
+	manager := NewUploadManager()
+	controller := NewUploadController("test-session", manager)
+
+	// Test initial state
+	if controller.State() != StateRunning {
+		t.Errorf("expected initial state StateRunning, got %v", controller.State())
+	}
+
+	// Test pause
+	controller.Pause()
+	if controller.State() != StatePaused {
+		t.Errorf("expected state StatePaused after pause, got %v", controller.State())
+	}
+
+	// Test resume
+	controller.Resume()
+	if controller.State() != StateRunning {
+		t.Errorf("expected state StateRunning after resume, got %v", controller.State())
+	}
+}
+
+func TestUploadStatus_String(t *testing.T) {
+	statuses := []UploadStatus{
+		StatusQueued,
+		StatusRunning,
+		StatusPaused,
+		StatusCompleted,
+		StatusFailed,
+	}
+
+	expectedStrings := []string{
+		"queued",
+		"running",
+		"paused",
+		"completed",
+		"failed",
+	}
+
+	for i, status := range statuses {
+		if string(status) != expectedStrings[i] {
+			t.Errorf("expected status string '%s', got '%s'", expectedStrings[i], string(status))
+		}
+	}
+}
+
+func TestProgressInfo_WithSessionID(t *testing.T) {
+	info := ProgressInfo{
+		Filename:    "test.txt",
+		Current:     50,
+		Total:       100,
+		Percentage:  50.0,
+		ChunkIndex:  1,
+		TotalChunks: 4,
+		SessionID:   "test-session-123",
+	}
+
+	if info.SessionID != "test-session-123" {
+		t.Errorf("expected SessionID 'test-session-123', got '%s'", info.SessionID)
+	}
+
+	if info.Percentage != 50.0 {
+		t.Errorf("expected Percentage 50.0, got %f", info.Percentage)
+	}
+}
+
+func TestEventInfo_WithSessionID(t *testing.T) {
+	info := EventInfo{
+		Event:     EventUploadStarted,
+		Filename:  "test.txt",
+		Path:      "/remote/test.txt",
+		Message:   "Upload started",
+		SessionID: "test-session-123",
+	}
+
+	if info.SessionID != "test-session-123" {
+		t.Errorf("expected SessionID 'test-session-123', got '%s'", info.SessionID)
+	}
+
+	if info.Event != EventUploadStarted {
+		t.Errorf("expected Event EventUploadStarted, got %v", info.Event)
+	}
+}
+
+// Integration test for multi-client upload coordination
+func TestMultiClientUploadCoordination(t *testing.T) {
+	manager := NewUploadManager()
+
+	// Create multiple clients
+	client1 := NewClient("http://example1.com", "user1", "pass1")
+	client2 := NewClient("http://example2.com", "user2", "pass2")
+
+	// Track events and progress
+	var events []EventInfo
+	var progressUpdates []ProgressInfo
+
+	// Create config with callbacks
+
+	client1.config = &Config{
+		ChunkSize:  1024,
+		MaxRetries: 3,
+		EventFunc: func(info EventInfo) {
+			events = append(events, info)
+		},
+		ProgressFunc: func(info ProgressInfo) {
+			progressUpdates = append(progressUpdates, info)
+		},
+	}
+
+	client2.config = &Config{
+		ChunkSize:  1024,
+		MaxRetries: 3,
+		EventFunc: func(info EventInfo) {
+			events = append(events, info)
+		},
+		ProgressFunc: func(info ProgressInfo) {
+			progressUpdates = append(progressUpdates, info)
+		},
+	}
+
+	// Add multiple upload sessions
+	session1, err := manager.AddUploadSession("/local/file1.txt", "/remote/file1.txt", client1)
+	if err != nil {
+		t.Fatalf("error adding session1: %v", err)
+	}
+
+	session2, err := manager.AddUploadSession("/local/file2.txt", "/remote/file2.txt", client2)
+	if err != nil {
+		t.Fatalf("error adding session2: %v", err)
+	}
+
+	session3, err := manager.AddUploadSession("/local/file3.txt", "/remote/file3.txt", client1)
+	if err != nil {
+		t.Fatalf("error adding session3: %v", err)
+	}
+
+	// Verify sessions are created with unique IDs
+	if session1.ID == session2.ID || session1.ID == session3.ID || session2.ID == session3.ID {
+		t.Error("expected all sessions to have unique IDs")
+	}
+
+	// Test coordinated pause
+	// Set some sessions as running first
+	session1.Status = StatusRunning
+	session2.Status = StatusRunning
+	session3.Status = StatusRunning
+	manager.sessions[session1.ID] = session1
+	manager.sessions[session2.ID] = session2
+	manager.sessions[session3.ID] = session3
+
+	manager.PauseAllUploads()
+
+	// Verify all sessions are paused
+	sessions := manager.GetUploadSessions()
+	for _, session := range sessions {
+		if session.Status != StatusPaused {
+			t.Errorf("expected session %s to be paused, got %v", session.ID, session.Status)
+		}
+	}
+
+	if !manager.IsGloballyPaused() {
+		t.Error("expected manager to be globally paused")
+	}
+
+	// Test individual resume
+	err = manager.ResumeUpload(session2.ID)
+	if err != nil {
+		t.Fatalf("error resuming session2: %v", err)
+	}
+
+	resumedSession, _ := manager.GetUploadSession(session2.ID)
+	if resumedSession.Status != StatusRunning {
+		t.Errorf("expected session2 to be running after individual resume, got %v", resumedSession.Status)
+	}
+
+	// Test coordinated resume
+	manager.ResumeAllUploads()
+
+	if manager.IsGloballyPaused() {
+		t.Error("expected manager to not be globally paused after resume all")
+	}
+
+	sessions = manager.GetUploadSessions()
+	for _, session := range sessions {
+		if session.Status != StatusRunning {
+			t.Errorf("expected session %s to be running after resume all, got %v", session.ID, session.Status)
+		}
+	}
+
+	// Test that session IDs are properly set in controllers
+	for _, session := range sessions {
+		if session.Controller.sessionID != session.ID {
+			t.Errorf("expected controller sessionID to match session ID, got %s != %s",
+				session.Controller.sessionID, session.ID)
+		}
+	}
+
+	// Verify sessions can be removed when completed
+	session1.Status = StatusCompleted
+	manager.sessions[session1.ID] = session1
+
+	err = manager.RemoveUploadSession(session1.ID)
+	if err != nil {
+		t.Fatalf("error removing completed session: %v", err)
+	}
+
+	// Verify it's actually removed
+	_, err = manager.GetUploadSession(session1.ID)
+	if err == nil {
+		t.Error("expected error when getting removed session")
+	}
+
+	remainingSessions := manager.GetUploadSessions()
+	if len(remainingSessions) != 2 {
+		t.Errorf("expected 2 remaining sessions, got %d", len(remainingSessions))
 	}
 }
