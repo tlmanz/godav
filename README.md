@@ -29,6 +29,7 @@ The library is organized into focused modules for better maintainability and cla
 - Recursive directory uploads
 - Progress reporting and verbose logging
 - Skips files that already exist with the same size
+- Upload Manager for multi-session control (queue, start, pause/resume, remove)
 - **Performance optimizations:**
   - Buffer pooling to reduce memory allocations
   - Automatic retry logic for failed chunks
@@ -259,6 +260,16 @@ Notes:
 - Manager uses each client’s current config (set via `client.SetConfig`) and injects a session-specific `UploadController` enabling pause/resume.
 - Use `ProgressFunc` and `EventFunc` in the client’s config to observe per-session `SessionID` values for UI updates.
 - For resumable uploads across restarts, pair manager flows with `CheckpointFunc` to persist progress; resume with `client.ResumeUpload` or by configuring `ResumeFromCheckpoint` and calling an upload.
+
+#### Cleanup and GC
+
+- The manager keeps completed/failed sessions in its internal map until removed. To allow the session and its associated client/controller to be garbage-collected, call:
+
+```go
+_ = manager.RemoveUploadSession(sessionID)
+```
+
+- There’s no explicit Close() for the client; once no references remain (including in manager sessions), it can be collected by Go’s GC.
 
 ## Configuration
 

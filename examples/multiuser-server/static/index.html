@@ -1,0 +1,199 @@
+<!doctype html>
+<html>
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>godav multi-user uploader</title>
+  <style>
+    body {
+      font-family: system-ui, sans-serif;
+      margin: 2rem;
+    }
+
+    input,
+    button {
+      padding: .5rem;
+      margin: .25rem 0;
+    }
+
+    fieldset {
+      margin-bottom: 1rem;
+    }
+
+    .row {
+      display: flex;
+      gap: .5rem;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .log {
+      background: #111;
+      color: #ddd;
+      padding: .5rem;
+      height: 200px;
+      overflow: auto;
+      border-radius: 6px;
+    }
+
+    .session {
+      border: 1px solid #ddd;
+      padding: .5rem;
+      margin: .5rem 0;
+      border-radius: 6px;
+    }
+
+    .progress {
+      height: 8px;
+      background: #eee;
+      border-radius: 4px;
+      overflow: hidden;
+    }
+
+    .progress>div {
+      height: 100%;
+      background: #4caf50;
+      width: 0%;
+    }
+
+    label {
+      display: block;
+      font-size: .9rem;
+      color: #333;
+    }
+
+    .small {
+      font-size: .85rem;
+      color: #666;
+    }
+  </style>
+</head>
+
+<body>
+  <h1>godav multi-user uploader</h1>
+
+  <fieldset>
+    <legend>Start Upload</legend>
+    <label>User ID <input id="userId" placeholder="alice" /></label>
+    <label>Base URL <input id="baseURL" placeholder="https://nextcloud.example.com/remote.php/dav/" size="60" /></label>
+    <label>DAV Username <input id="davUser" placeholder="alice" /></label>
+    <label>DAV App Password <input id="davPass" type="password" placeholder="••••••" /></label>
+    <label>Local Path <input id="localPath" placeholder="/path/to/local/file.bin" size="60" /></label>
+    <label>Remote Path <input id="remotePath" placeholder="Uploads/file.bin" size="60" /></label>
+    <button id="startBtn">Start Upload</button>
+    <div class="small">Note: Local Path must be readable by the server process running this sample.</div>
+  </fieldset>
+
+  <fieldset>
+    <legend>Sessions (per user)</legend>
+    <label>Listen User ID <input id="listenUser" placeholder="alice" /></label>
+    <button id="connectSSE">Connect Stream</button>
+    <div id="sessions"></div>
+  </fieldset>
+
+  <div class="log" id="log"></div>
+
+  <script>
+    const logEl = document.getElementById('log');
+    function log(msg) {
+      const t = new Date().toISOString();
+      logEl.textContent += `[${t}] ${msg}\n`;
+      logEl.scrollTop = logEl.scrollHeight;
+    }
+
+    const sessionsEl = document.getElementById('sessions');
+    const sessionUIs = new Map(); // sessionId -> {root, bar, label}
+
+    function ensureSessionUI(sessionId, filename) {
+      if (sessionUIs.has(sessionId)) return sessionUIs.get(sessionId);
+      const root = document.createElement('div');
+      root.className = 'session';
+      root.innerHTML = `
+    <div><b>Session:</b> <span class="sid"></span> — <span class="file"></span></div>
+    <div class="progress"><div></div></div>
+    <div class="row">
+      <button class="pause">Pause</button>
+      <button class="resume">Resume</button>
+      <button class="cancel">Cancel</button>
+      <span class="status small"></span>
+    </div>
+  `;
+      root.querySelector('.sid').textContent = sessionId;
+      root.querySelector('.file').textContent = filename || '';
+      const bar = root.querySelector('.progress > div');
+      const status = root.querySelector('.status');
+      root.querySelector('.pause').onclick = () => doAction(sessionId, 'pause');
+      root.querySelector('.resume').onclick = () => doAction(sessionId, 'resume');
+      root.querySelector('.cancel').onclick = () => doAction(sessionId, 'cancel');
+      sessionsEl.prepend(root);
+      const ui = { root, bar, status };
+      sessionUIs.set(sessionId, ui);
+      return ui;
+    }
+
+    async function doAction(sessionId, action) {
+      let method = 'POST';
+      if (action === 'cancel') method = 'DELETE';
+      const res = await fetch(`/api/uploads/${sessionId}/${action}`, { method });
+      const ok = res.ok;
+      log(`${action.toUpperCase()} ${sessionId} -> ${ok}`);
+    }
+
+    async function startUpload() {
+      const body = {
+        userId: document.getElementById('userId').value.trim(),
+        baseURL: document.getElementById('baseURL').value.trim(),
+        davUser: document.getElementById('davUser').value.trim(),
+        davPass: document.getElementById('davPass').value,
+        localPath: document.getElementById('localPath').value.trim(),
+        remotePath: document.getElementById('remotePath').value.trim(),
+      };
+      const res = await fetch('/api/uploads/start', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+      });
+      const data = await res.json();
+      if (res.ok) {
+        log(`Started session ${data.sessionId}`);
+      } else {
+        log(`Start failed: ${data.error || res.status}`);
+      }
+    }
+
+    document.getElementById('startBtn').onclick = startUpload;
+
+    let evtSrc;
+    function connectStream() {
+      const user = document.getElementById('listenUser').value.trim();
+      if (!user) return alert('Enter Listen User ID');
+      if (evtSrc) evtSrc.close();
+      evtSrc = new EventSource(`/api/users/${encodeURIComponent(user)}/stream`);
+      evtSrc.addEventListener('hello', () => log(`Connected to user ${user} stream`));
+      evtSrc.addEventListener('progress', (e) => {
+        try {
+          const p = JSON.parse(e.data);
+          const ui = ensureSessionUI(p.SessionID || p.sessionId || 'unknown', p.Filename || p.filename || '');
+          const pct = Math.max(0, Math.min(100, p.Percentage || p.percentage || 0));
+          ui.bar.style.width = pct.toFixed(1) + '%';
+          ui.status.textContent = `${pct.toFixed(1)}% (${(p.ChunkIndex + 1) || 0}/${p.TotalChunks || 0})`;
+        } catch (err) { log('progress parse error'); }
+      });
+      evtSrc.addEventListener('event', (e) => {
+        try {
+          const ev = JSON.parse(e.data);
+          const ui = ensureSessionUI(ev.SessionID || 'unknown', ev.Filename || '');
+          if (ev.Event === 'upload_complete') ui.status.textContent = 'completed';
+          if (ev.Event === 'upload_failed') ui.status.textContent = 'failed';
+          if (ev.Event === 'upload_paused') ui.status.textContent = 'paused';
+          if (ev.Event === 'upload_resumed') ui.status.textContent = 'running';
+          log(`event: ${ev.Event} file=${ev.Filename} msg=${ev.Message || ''}`);
+        } catch (err) { log('event parse error'); }
+      });
+      evtSrc.onerror = () => log('SSE error');
+    }
+
+    document.getElementById('connectSSE').onclick = connectStream;
+  </script>
+</body>
+
+</html>
