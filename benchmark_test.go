@@ -60,21 +60,20 @@ func BenchmarkPathJoin(b *testing.B) {
 
 func BenchmarkValidateConfig(b *testing.B) {
 	c := NewClient("http://example.com", "user", "pass")
-	config := &Config{
-		ChunkSize:  1024 * 1024,
-		MaxRetries: 3,
-		Verbose:    true,
-	}
+	c.config.ChunkSize = 1024 * 1024
+	c.config.MaxRetries = 3
+	c.config.Verbose = true
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		_ = c.validateConfig(config)
+		_ = c.validateConfig()
 	}
 }
 
 func BenchmarkUploadController(b *testing.B) {
-	controller := NewUploadController()
-	
+	manager := NewUploadManager()
+	controller := NewUploadController("benchmark-test", manager)
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		controller.Pause()
@@ -86,7 +85,7 @@ func BenchmarkUploadController(b *testing.B) {
 func BenchmarkCheckpointSerialization(b *testing.B) {
 	checkpoint := Checkpoint{
 		LocalPath:      "/test/file.txt",
-		RemotePath:     "remote/file.txt", 
+		RemotePath:     "remote/file.txt",
 		UploadID:       "test-123",
 		FileSize:       1000000,
 		ChunkSize:      10240,
@@ -95,7 +94,7 @@ func BenchmarkCheckpointSerialization(b *testing.B) {
 		TotalChunks:    97,
 		Timestamp:      time.Now(),
 	}
-	
+
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		data, _ := json.Marshal(checkpoint)
