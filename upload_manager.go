@@ -13,6 +13,7 @@
 package godav
 
 import (
+	"context"
 	"fmt"
 	"path/filepath"
 	"sync"
@@ -55,11 +56,8 @@ type UploadSession struct {
 //	err = manager.StartUpload(session.ID)
 func NewUploadManager() *UploadManager {
 	return &UploadManager{
-		sessions: make(map[string]*UploadSession),
-		globalCtrl: &GlobalController{
-			pauseCh:  make(chan struct{}, 1),
-			resumeCh: make(chan struct{}, 1),
-		},
+		sessions:   make(map[string]*UploadSession),
+		globalCtrl: &GlobalController{},
 	}
 }
 
@@ -122,16 +120,17 @@ func (um *UploadManager) StartUpload(sessionID string) error {
 		return fmt.Errorf("session %s not found", sessionID)
 	}
 
-	if session.Status != StatusQueued && session.Status != StatusPaused {
-		return fmt.Errorf("session %s cannot be started (current status: %s)", sessionID, session.Status)
+	if session.Status != StatusQueued {
+		return fmt.Errorf("session %s cannot be started (current status: %s); use ResumeUpload for paused sessions", sessionID, session.Status)
 	}
 
 	session.Status = StatusRunning
 	session.UpdatedAt = time.Now()
 
-	// Start upload in goroutine
+	// Start upload in goroutine using the pre-cloned session config directly,
+	// avoiding any mutation of the shared client's c.config.
 	go func(sess *UploadSession) {
-		err := sess.Client.UploadFileWithConfig(sess.LocalPath, sess.RemotePath, sess.Config)
+		err := sess.Client.uploadFileCore(context.Background(), sess.LocalPath, sess.RemotePath, sess.Config)
 		um.mu.Lock()
 		if err != nil {
 			sess.Status = StatusFailed

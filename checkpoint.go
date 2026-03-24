@@ -12,6 +12,7 @@
 package godav
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -62,7 +63,7 @@ func SaveCheckpoint(checkpoint Checkpoint, filePath string) error {
 		return fmt.Errorf("marshal checkpoint: %w", err)
 	}
 
-	return os.WriteFile(filePath, data, 0644)
+	return os.WriteFile(filePath, data, 0600)
 }
 
 // LoadCheckpoint loads a checkpoint from a JSON file.
@@ -96,19 +97,18 @@ func LoadCheckpoint(filePath string) (*Checkpoint, error) {
 	return &checkpoint, nil
 }
 
-// ResumeUpload resumes an upload from a checkpoint
+// ResumeUpload resumes an upload from a checkpoint.
+// It creates an isolated config copy for the resume operation so that
+// c.config is never mutated and no stale ResumeFromCheckpoint lingers.
 func (c *Client) ResumeUpload(checkpoint Checkpoint) error {
-	if c.config == nil {
-		c.config = DefaultConfig()
-	}
+	cfg := validateConfigWith(c.config)
+	cfg.ChunkSize = checkpoint.ConfigChunkSize
+	cfg.SkipExisting = checkpoint.ConfigSkipExisting
+	cfg.MaxRetries = checkpoint.ConfigMaxRetries
+	cfg.ResumeFromCheckpoint = &checkpoint
 
-	// Restore config values from checkpoint
-	c.config.ChunkSize = checkpoint.ConfigChunkSize
-	c.config.SkipExisting = checkpoint.ConfigSkipExisting
-	c.config.MaxRetries = checkpoint.ConfigMaxRetries
+	// Re-validate after overriding checkpoint values.
+	cfg = validateConfigWith(cfg)
 
-	// Set the checkpoint in config
-	c.config.ResumeFromCheckpoint = &checkpoint
-
-	return c.UploadFile(checkpoint.LocalPath, checkpoint.RemotePath)
+	return c.uploadFileCore(context.Background(), checkpoint.LocalPath, checkpoint.RemotePath, cfg)
 }

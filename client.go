@@ -29,6 +29,7 @@ package godav
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -80,8 +81,7 @@ func (c *Client) SetVerbose(verbose bool) {
 // The provided config is validated and sanitized.
 // Not safe to change concurrently with ongoing uploads on the same client.
 func (c *Client) SetConfig(cfg *Config) {
-	c.config = cfg
-	c.config = c.validateConfig()
+	c.config = validateConfigWith(cfg)
 }
 
 // UploadFile uploads a single file using Nextcloud's chunked upload protocol.
@@ -110,19 +110,13 @@ func (c *Client) SetConfig(cfg *Config) {
 //		}
 //	}
 func (c *Client) UploadFile(localPath, dstPath string) error {
-	return c.uploadFileCore(context.Background(), localPath, dstPath)
+	return c.uploadFileCore(context.Background(), localPath, dstPath, c.config)
 }
 
 // UploadFileWithConfig uploads a single file using the provided config (does not mutate the client's default config).
-// Not safe to call concurrently with other uploads on the same client instance.
+// Safe to call concurrently with other uploads since c.config is not touched.
 func (c *Client) UploadFileWithConfig(localPath, dstPath string, cfg *Config) error {
-	// Temporarily override client config
-	prev := c.config
-	c.config = cfg
-	c.config = c.validateConfig()
-	defer func() { c.config = prev }()
-
-	return c.uploadFileCore(context.Background(), localPath, dstPath)
+	return c.uploadFileCore(context.Background(), localPath, dstPath, validateConfigWith(cfg))
 }
 
 // UploadFileWithContext uploads a single file with context support for cancellation and timeouts.
@@ -147,22 +141,17 @@ func (c *Client) UploadFileWithConfig(localPath, dstPath string, cfg *Config) er
 //		fmt.Println("Upload timed out")
 //	}
 func (c *Client) UploadFileWithContext(ctx context.Context, localPath, dstPath string) error {
-	return c.uploadFileCore(ctx, localPath, dstPath)
+	return c.uploadFileCore(ctx, localPath, dstPath, c.config)
 }
 
 // UploadFileWithContextWithConfig uploads with context and the provided config (does not mutate the client's default config).
-// Not safe to call concurrently with other uploads on the same client instance.
+// Safe to call concurrently with other uploads since c.config is not touched.
 func (c *Client) UploadFileWithContextWithConfig(ctx context.Context, localPath, dstPath string, cfg *Config) error {
-	prev := c.config
-	c.config = cfg
-	c.config = c.validateConfig()
-	defer func() { c.config = prev }()
-
-	return c.uploadFileCore(ctx, localPath, dstPath)
+	return c.uploadFileCore(ctx, localPath, dstPath, validateConfigWith(cfg))
 }
 
-// uploadFileCore contains the core logic for file upload, assuming c.config is already validated.
-func (c *Client) uploadFileCore(ctx context.Context, localPath, dstPath string) error {
+// uploadFileCore contains the core logic for file upload using the provided cfg.
+func (c *Client) uploadFileCore(ctx context.Context, localPath, dstPath string, cfg *Config) error {
 	// Check for cancellation
 	select {
 	case <-ctx.Done():
@@ -172,7 +161,7 @@ func (c *Client) uploadFileCore(ctx context.Context, localPath, dstPath string) 
 
 	// Emit upload started event
 	filename := filepath.Base(localPath)
-	c.emitEvent(EventUploadStarted, filename, dstPath, "Upload started", nil)
+	c.emitEvent(cfg, EventUploadStarted, filename, dstPath, "Upload started", nil)
 
 	// Convert to Nextcloud files path and validate
 	cleaned := c.sanitizeRemotePath(dstPath)
@@ -182,13 +171,13 @@ func (c *Client) uploadFileCore(ctx context.Context, localPath, dstPath string) 
 	finalPath := c.pathJoinMany("files", c.username, cleaned)
 
 	// Skip if exists with same size
-	if c.config.SkipExisting {
+	if cfg.SkipExisting {
 		if info, err := c.Stat(finalPath); err == nil && !info.IsDir() {
 			if localInfo, lerr := os.Stat(localPath); lerr == nil && info.Size() == localInfo.Size() {
-				if c.config.Verbose {
+				if cfg.Verbose {
 					log.Printf("Skip unchanged: %s", finalPath)
 				}
-				c.emitEvent(EventUploadSkipped, filename, dstPath, "File already exists with same size", nil)
+				c.emitEvent(cfg, EventUploadSkipped, filename, dstPath, "File already exists with same size", nil)
 				return nil
 			}
 		}
@@ -197,27 +186,30 @@ func (c *Client) uploadFileCore(ctx context.Context, localPath, dstPath string) 
 	// Ensure destination directory exists
 	if dir := c.dirOf(finalPath); dir != "" {
 		if err := c.MkdirAll(dir, 0o755); err != nil && !c.isAlreadyExists(err) {
-			if c.config.Verbose {
+			if cfg.Verbose {
 				log.Printf("mkdir final dir %s: %v", dir, err)
 			}
 		}
 	}
 
-	err := c.uploadChunked(ctx, localPath, finalPath)
+	err := c.uploadChunked(ctx, localPath, finalPath, cfg)
 	if err != nil {
-		c.emitEvent(EventUploadFailed, filename, dstPath, "Upload failed", err)
+		c.emitEvent(cfg, EventUploadFailed, filename, dstPath, "Upload failed", err)
 		return err
 	}
 
-	c.emitEvent(EventUploadComplete, filename, dstPath, "Upload completed successfully", nil)
+	c.emitEvent(cfg, EventUploadComplete, filename, dstPath, "Upload completed successfully", nil)
 	return nil
 }
 
 // UploadDir uploads a directory recursively using chunked uploads.
+// Errors from individual file uploads are collected and returned as a combined error;
+// the walk continues even when a file fails.
 func (c *Client) UploadDir(localDir, dstDir string) error {
 	c.config = c.validateConfig()
 
-	return filepath.Walk(localDir, func(localPath string, info os.FileInfo, err error) error {
+	var uploadErrs []error
+	walkErr := filepath.Walk(localDir, func(localPath string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -244,12 +236,17 @@ func (c *Client) UploadDir(localDir, dstDir string) error {
 				}
 			}
 		} else {
-			// Upload file
+			// Upload file; collect error but continue the walk
 			if err := c.UploadFile(localPath, remotePath); err != nil {
 				log.Printf("upload %s: %v", remotePath, err)
+				uploadErrs = append(uploadErrs, fmt.Errorf("%s: %w", remotePath, err))
 			}
 		}
 
 		return nil
 	})
+	if walkErr != nil {
+		return walkErr
+	}
+	return errors.Join(uploadErrs...)
 }

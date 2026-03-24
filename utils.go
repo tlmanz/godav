@@ -36,15 +36,10 @@ func (c *Client) sanitizeRemotePath(p string) string {
 			p = ""
 		}
 	}
-	// Clean to collapse any ./ or ../ segments
-	cleaned := path.Clean("/" + p) // ensure absolute for Clean semantics
-	cleaned = strings.TrimPrefix(cleaned, "/")
-	// Reject traversal
-	if cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.Contains(cleaned, "/../") {
-		// Drop to empty to avoid writing outside user's files root
-		cleaned = ""
-	}
-	return cleaned
+	// path.Clean on an absolute path prevents traversal beyond root;
+	// stripping the leading slash gives a safe relative path.
+	cleaned := path.Clean("/" + p)
+	return strings.TrimPrefix(cleaned, "/")
 }
 
 func (c *Client) toFilesPath(dstPath string) string {
@@ -101,63 +96,57 @@ func (c *Client) newUploadID() string {
 	return fmt.Sprintf("web-file-upload-%d", time.Now().UnixNano())
 }
 
-// emitEvent calls the event callback if configured
-func (c *Client) emitEvent(event UploadEvent, filename, path, message string, err error) {
-	if c.config.EventFunc != nil {
-		sessionID := ""
-		if c.config.Controller != nil {
-			sessionID = c.config.Controller.sessionID
-		}
-
-		info := EventInfo{
-			Event:     event,
-			Filename:  filename,
-			Path:      path,
-			Message:   message,
-			Error:     err,
-			SessionID: sessionID,
-		}
-		c.config.EventFunc(info)
+// emitEvent calls the event callback if configured.
+// cfg is passed explicitly so callers can use a local copy and avoid races on c.config.
+func (c *Client) emitEvent(cfg *Config, event UploadEvent, filename, path, message string, err error) {
+	if cfg == nil || cfg.EventFunc == nil {
+		return
 	}
+	sessionID := ""
+	if cfg.Controller != nil {
+		sessionID = cfg.Controller.sessionID
+	}
+	info := EventInfo{
+		Event:     event,
+		Filename:  filename,
+		Path:      path,
+		Message:   message,
+		Error:     err,
+		SessionID: sessionID,
+	}
+	cfg.EventFunc(info)
 }
 
-// validateConfig validates and sanitizes the configuration
-func (c *Client) validateConfig() *Config {
-	if c.config == nil {
+// validateConfigWith returns a validated copy of cfg without mutating the original.
+func validateConfigWith(cfg *Config) *Config {
+	if cfg == nil {
 		return DefaultConfig()
 	}
-
-	// Ensure chunk size is reasonable
-	if c.config.ChunkSize <= 0 {
-		c.config.ChunkSize = 10 * 1024 * 1024 // 10MB default
+	out := *cfg // shallow copy; function pointers are shared intentionally
+	if out.ChunkSize <= 0 {
+		out.ChunkSize = 10 * 1024 * 1024
 	}
-
-	// Minimum chunk size of 1KB to avoid excessive requests
-	if c.config.ChunkSize < 1024 {
-		c.config.ChunkSize = 1024
+	if out.ChunkSize < 1024 {
+		out.ChunkSize = 1024
 	}
-
-	// Maximum chunk size of 1GB to avoid memory issues
-	if c.config.ChunkSize > 1024*1024*1024 {
-		c.config.ChunkSize = 1024 * 1024 * 1024
+	if out.ChunkSize > 1024*1024*1024 {
+		out.ChunkSize = 1024 * 1024 * 1024
 	}
-
-	// Ensure max retries is reasonable
-	if c.config.MaxRetries < 0 {
-		c.config.MaxRetries = 0
+	if out.MaxRetries < 0 {
+		out.MaxRetries = 0
 	}
-	if c.config.MaxRetries > 10 {
-		c.config.MaxRetries = 10 // Cap at 10 retries
+	if out.MaxRetries > 10 {
+		out.MaxRetries = 10
 	}
-
-	// Ensure buffer pool (if provided) matches chunk size to avoid reallocation churn
-	if c.config.BufferPool != nil {
-		if c.config.BufferPool.size != c.config.ChunkSize {
-			// Recreate a matching pool with a small default size
-			c.config.BufferPool = NewBufferPool(c.config.ChunkSize, 4)
-		}
+	if out.BufferPool != nil && out.BufferPool.size != out.ChunkSize {
+		out.BufferPool = NewBufferPool(out.ChunkSize, 4)
 	}
+	return &out
+}
 
+// validateConfig validates and sanitizes c.config in-place (used by SetConfig and UploadDir).
+func (c *Client) validateConfig() *Config {
+	c.config = validateConfigWith(c.config)
 	return c.config
 }
 

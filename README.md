@@ -61,12 +61,13 @@ func main() {
 		log.Fatal(err)
 	}
 
-	// Upload a directory recursively (uses the client's internal config)
-	// For now, set simple flags via methods like SetVerbose; per-call config is not supported for directories.
+	// Upload a directory recursively.
+	// UploadDir uses the client's default config (set via SetConfig or SetVerbose).
+	// It returns a combined error of any per-file failures so the caller can detect partial uploads.
 	client.SetVerbose(true)
 	err = client.UploadDir("/path/to/local/dir", "remote/path/dir")
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal(err) // may contain multiple file errors joined together
 	}
 }
 ```
@@ -272,6 +273,7 @@ Notes:
 - Manager uses each client’s current config (set via `client.SetConfig`) and injects a session-specific `UploadController` enabling pause/resume.
 - Use `ProgressFunc` and `EventFunc` in the client’s config to observe per-session `SessionID` values for UI updates.
 - For resumable uploads across restarts, pair manager flows with `CheckpointFunc` to persist progress; resume with `client.ResumeUpload` or by configuring `ResumeFromCheckpoint` and calling an upload.
+- `StartUpload` only accepts sessions in `StatusQueued` state. To resume a paused session, call `manager.ResumeUpload(sessionID)` instead.
 
 #### Cleanup and GC
 
@@ -325,7 +327,8 @@ controller.Cancel()
 
 // Resume from a saved checkpoint (two options)
 if cp, err := godav.LoadCheckpoint("/tmp/upload_checkpoint.json"); err == nil {
-	// A) One-call quick resume
+	// A) One-call quick resume.
+	//    ResumeUpload builds an isolated config copy — it does NOT mutate the client's default config.
 	_ = client.ResumeUpload(*cp)
 
 	// B) Full control resume with callbacks
@@ -337,6 +340,8 @@ if cp, err := godav.LoadCheckpoint("/tmp/upload_checkpoint.json"); err == nil {
 	_ = client.UploadFileWithConfig(cp.LocalPath, cp.RemotePath, cfg)
 }
 ```
+
+> **Security note:** `SaveCheckpoint` writes files with mode `0600` (owner read/write only) since checkpoints contain local and remote file paths.
 
 ### Performance Configuration
 

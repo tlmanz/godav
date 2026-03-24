@@ -25,7 +25,7 @@ import (
 // 1) MKCOL /uploads/<user>/<upload-id>
 // 2) PUT /uploads/<user>/<upload-id>/<offset> for each chunk
 // 3) MOVE /uploads/<user>/<upload-id>/.file -> /files/<user>/<dst>
-func (c *Client) uploadChunked(ctx context.Context, localPath, finalPath string) error {
+func (c *Client) uploadChunked(ctx context.Context, localPath, finalPath string, cfg *Config) error {
 	// Cache filename to avoid repeated path.Base calls
 	filename := filepath.Base(localPath)
 
@@ -36,15 +36,15 @@ func (c *Client) uploadChunked(ctx context.Context, localPath, finalPath string)
 	var sent int64
 	var chunkIndex int
 
-	if c.config.ResumeFromCheckpoint != nil {
+	if cfg.ResumeFromCheckpoint != nil {
 		// Resume from checkpoint
-		uploadID = c.config.ResumeFromCheckpoint.UploadID
+		uploadID = cfg.ResumeFromCheckpoint.UploadID
 		uploadBase = c.pathJoinMany("uploads", c.username, uploadID)
-		sent = c.config.ResumeFromCheckpoint.BytesUploaded
-		chunkIndex = c.config.ResumeFromCheckpoint.ChunksUploaded
-		startOffset = int64(chunkIndex) * c.config.ChunkSize
+		sent = cfg.ResumeFromCheckpoint.BytesUploaded
+		chunkIndex = cfg.ResumeFromCheckpoint.ChunksUploaded
+		startOffset = int64(chunkIndex) * cfg.ChunkSize
 
-		c.emitEvent(EventUploadResumed, filename, finalPath,
+		c.emitEvent(cfg, EventUploadResumed, filename, finalPath,
 			fmt.Sprintf("Resuming from chunk %d", chunkIndex), nil)
 	} else {
 		// New upload
@@ -84,14 +84,13 @@ func (c *Client) uploadChunked(ctx context.Context, localPath, finalPath string)
 		}
 	}
 
-	// Validate chunk size
-	chunkSize := c.config.ChunkSize
+	chunkSize := cfg.ChunkSize
 
 	// Use buffer pool if available, otherwise allocate
 	var buf []byte
-	if c.config.BufferPool != nil {
-		buf = c.config.BufferPool.Get()
-		defer c.config.BufferPool.Put(buf)
+	if cfg.BufferPool != nil {
+		buf = cfg.BufferPool.Get()
+		defer cfg.BufferPool.Put(buf)
 		// Resize buffer if needed
 		if int64(len(buf)) != chunkSize {
 			buf = make([]byte, chunkSize)
@@ -110,13 +109,13 @@ func (c *Client) uploadChunked(ctx context.Context, localPath, finalPath string)
 		default:
 		}
 		// Check for pause/resume/cancel
-		if c.config.Controller != nil {
-			switch c.config.Controller.State() {
+		if cfg.Controller != nil {
+			switch cfg.Controller.State() {
 			case StatePaused:
-				c.emitEvent(EventUploadPaused, filename, finalPath, "Upload paused", nil)
+				c.emitEvent(cfg, EventUploadPaused, filename, finalPath, "Upload paused", nil)
 
 				// Save checkpoint
-				if c.config.CheckpointFunc != nil {
+				if cfg.CheckpointFunc != nil {
 					checkpoint := Checkpoint{
 						LocalPath:          localPath,
 						RemotePath:         finalPath,
@@ -127,17 +126,17 @@ func (c *Client) uploadChunked(ctx context.Context, localPath, finalPath string)
 						ChunksUploaded:     chunkIndex,
 						TotalChunks:        totalChunks,
 						Timestamp:          time.Now(),
-						ConfigChunkSize:    c.config.ChunkSize,
-						ConfigSkipExisting: c.config.SkipExisting,
-						ConfigMaxRetries:   c.config.MaxRetries,
+						ConfigChunkSize:    cfg.ChunkSize,
+						ConfigSkipExisting: cfg.SkipExisting,
+						ConfigMaxRetries:   cfg.MaxRetries,
 					}
-					c.config.CheckpointFunc(checkpoint)
+					cfg.CheckpointFunc(checkpoint)
 				}
 
 				// Wait for resume or cancel or context done
 				select {
-				case <-c.config.Controller.resumeCh:
-					c.emitEvent(EventUploadResumed, filename, finalPath, "Upload resumed", nil)
+				case <-cfg.Controller.resumeCh:
+					c.emitEvent(cfg, EventUploadResumed, filename, finalPath, "Upload resumed", nil)
 				case <-ctx.Done():
 					return ctx.Err()
 				case <-time.After(time.Hour): // Timeout after 1 hour
@@ -157,13 +156,15 @@ func (c *Client) uploadChunked(ctx context.Context, localPath, finalPath string)
 		}
 
 		n, rerr := io.ReadFull(f, buf[:want])
-		if rerr != nil && rerr != io.ErrUnexpectedEOF && rerr != io.EOF {
+		if rerr != nil {
+			// io.ErrUnexpectedEOF means the file shrank during upload — treat as an error
+			// to avoid uploading a corrupt (truncated) chunk silently.
 			return fmt.Errorf("read chunk at %d: %w", offset, rerr)
 		}
 
 		// Retry logic for chunk upload
 		var uploadErr error
-		for retry := 0; retry <= c.config.MaxRetries; retry++ {
+		for retry := 0; retry <= cfg.MaxRetries; retry++ {
 			// Check cancellation before each network write
 			select {
 			case <-ctx.Done():
@@ -176,9 +177,9 @@ func (c *Client) uploadChunked(ctx context.Context, localPath, finalPath string)
 				break // Success
 			}
 
-			if retry < c.config.MaxRetries {
-				if c.config.Verbose {
-					log.Printf("chunk upload retry %d/%d for %s: %v", retry+1, c.config.MaxRetries, chunkPath, uploadErr)
+			if retry < cfg.MaxRetries {
+				if cfg.Verbose {
+					log.Printf("chunk upload retry %d/%d for %s: %v", retry+1, cfg.MaxRetries, chunkPath, uploadErr)
 				}
 			}
 		}
@@ -188,7 +189,7 @@ func (c *Client) uploadChunked(ctx context.Context, localPath, finalPath string)
 				Op:      "chunk upload",
 				Path:    c.pathJoin(uploadBase, strconv.FormatInt(offset, 10)),
 				Err:     uploadErr,
-				Retries: c.config.MaxRetries,
+				Retries: cfg.MaxRetries,
 			}
 		}
 
@@ -196,14 +197,14 @@ func (c *Client) uploadChunked(ctx context.Context, localPath, finalPath string)
 		chunkIndex++
 
 		// Emit chunk uploaded event
-		c.emitEvent(EventChunkUploaded, filename, finalPath,
+		c.emitEvent(cfg, EventChunkUploaded, filename, finalPath,
 			fmt.Sprintf("Chunk %d/%d uploaded", chunkIndex, totalChunks), nil)
 
 		// Call progress callbacks if provided
-		if c.config.ProgressFunc != nil {
+		if cfg.ProgressFunc != nil {
 			sessionID := ""
-			if c.config.Controller != nil {
-				sessionID = c.config.Controller.sessionID
+			if cfg.Controller != nil {
+				sessionID = cfg.Controller.sessionID
 			}
 
 			percentage := float64(sent) / float64(total) * 100.0
@@ -216,17 +217,17 @@ func (c *Client) uploadChunked(ctx context.Context, localPath, finalPath string)
 				TotalChunks: totalChunks,
 				SessionID:   sessionID,
 			}
-			c.config.ProgressFunc(info)
+			cfg.ProgressFunc(info)
 		}
 
-		if c.config.Verbose {
+		if cfg.Verbose {
 			percentage := float64(sent) / float64(total) * 100.0
 			chunkPath := c.pathJoin(uploadBase, strconv.FormatInt(offset, 10))
 			log.Printf("chunk %s: +%d bytes (%d/%d, %.1f%%)", chunkPath, n, sent, total, percentage)
 		}
 
 		// Save checkpoint periodically (every 10 chunks)
-		if c.config.CheckpointFunc != nil && chunkIndex%10 == 0 {
+		if cfg.CheckpointFunc != nil && chunkIndex%10 == 0 {
 			checkpoint := Checkpoint{
 				LocalPath:          localPath,
 				RemotePath:         finalPath,
@@ -237,19 +238,19 @@ func (c *Client) uploadChunked(ctx context.Context, localPath, finalPath string)
 				ChunksUploaded:     chunkIndex,
 				TotalChunks:        totalChunks,
 				Timestamp:          time.Now(),
-				ConfigChunkSize:    c.config.ChunkSize,
-				ConfigSkipExisting: c.config.SkipExisting,
-				ConfigMaxRetries:   c.config.MaxRetries,
+				ConfigChunkSize:    cfg.ChunkSize,
+				ConfigSkipExisting: cfg.SkipExisting,
+				ConfigMaxRetries:   cfg.MaxRetries,
 			}
-			c.config.CheckpointFunc(checkpoint)
+			cfg.CheckpointFunc(checkpoint)
 		}
 	}
 
 	// All chunks uploaded
-	c.emitEvent(EventChunksComplete, filename, finalPath, "All chunks uploaded", nil)
+	c.emitEvent(cfg, EventChunksComplete, filename, finalPath, "All chunks uploaded", nil)
 
 	// Finalize: MOVE to final destination
-	c.emitEvent(EventMoveStarted, filename, finalPath, "Starting final move operation", nil)
+	c.emitEvent(cfg, EventMoveStarted, filename, finalPath, "Starting final move operation", nil)
 	// guard header mutation and rename in case same underlying client is shared
 	c.hdrMu.Lock()
 	c.SetHeader("OC-Total-Length", strconv.FormatInt(total, 10))
@@ -270,12 +271,12 @@ func (c *Client) uploadChunked(ctx context.Context, localPath, finalPath string)
 		return fmt.Errorf("finalize move %s -> %s: %w", src, finalPath, err)
 	}
 
-	c.emitEvent(EventMoveComplete, filename, finalPath, "Move operation completed", nil)
+	c.emitEvent(cfg, EventMoveComplete, filename, finalPath, "Move operation completed", nil)
 
 	// Cleanup
 	_ = c.RemoveAll(uploadBase)
 
-	if c.config.Verbose {
+	if cfg.Verbose {
 		log.Printf("Uploaded (chunked): %s", finalPath)
 	}
 
@@ -293,13 +294,10 @@ func (c *Client) UploadFileResumable(localPath, dstPath string) (*UploadControll
 		c.config.Controller = NewSimpleUploadController()
 	}
 
-	// Upload in a goroutine to enable pause/resume
+	// Upload in a goroutine to enable pause/resume.
+	// uploadFileCore already emits EventUploadFailed on error, so no duplicate emission here.
 	go func() {
-		err := c.UploadFile(localPath, dstPath)
-		if err != nil && c.config.EventFunc != nil {
-			filename := filepath.Base(localPath)
-			c.emitEvent(EventUploadFailed, filename, dstPath, "Upload failed", err)
-		}
+		_ = c.UploadFile(localPath, dstPath)
 	}()
 
 	return c.config.Controller, nil

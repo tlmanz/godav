@@ -314,7 +314,7 @@ func TestEmitEvent(t *testing.T) {
 	}
 
 	// Test emitting an event
-	c.emitEvent(EventUploadStarted, "test.txt", "remote/test.txt", "Test message", nil)
+	c.emitEvent(c.config, EventUploadStarted, "test.txt", "remote/test.txt", "Test message", nil)
 
 	if !eventCalled {
 		t.Error("expected event to be emitted")
@@ -336,7 +336,7 @@ func TestEmitEventWithNilConfig(t *testing.T) {
 	c.config.EventFunc = nil
 
 	// This should not panic
-	c.emitEvent(EventUploadStarted, "test.txt", "remote/test.txt", "Test message", nil)
+	c.emitEvent(c.config, EventUploadStarted, "test.txt", "remote/test.txt", "Test message", nil)
 }
 
 func TestUploadEvents(t *testing.T) {

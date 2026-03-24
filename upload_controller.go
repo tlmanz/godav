@@ -14,8 +14,6 @@ import (
 // GlobalController provides global pause/resume control across all uploads
 type GlobalController struct {
 	globalPaused bool
-	pauseCh      chan struct{}
-	resumeCh     chan struct{}
 	mu           sync.RWMutex
 }
 
@@ -24,7 +22,6 @@ type UploadController struct {
 	sessionID string
 	state     UploadState
 	stateCh   chan UploadState
-	pauseCh   chan struct{}
 	resumeCh  chan struct{}
 	manager   *UploadManager
 	mu        sync.RWMutex
@@ -36,7 +33,6 @@ func NewUploadController(sessionID string, manager *UploadManager) *UploadContro
 		sessionID: sessionID,
 		state:     StateRunning,
 		stateCh:   make(chan UploadState, 1),
-		pauseCh:   make(chan struct{}, 1),
 		resumeCh:  make(chan struct{}, 1),
 		manager:   manager,
 	}
@@ -48,7 +44,6 @@ func NewSimpleUploadController() *UploadController {
 		sessionID: fmt.Sprintf("session-%d", time.Now().UnixNano()),
 		state:     StateRunning,
 		stateCh:   make(chan UploadState, 1),
-		pauseCh:   make(chan struct{}, 1),
 		resumeCh:  make(chan struct{}, 1),
 	}
 }
@@ -57,13 +52,7 @@ func NewSimpleUploadController() *UploadController {
 func (uc *UploadController) Pause() {
 	uc.mu.Lock()
 	defer uc.mu.Unlock()
-	if uc.state == StateRunning {
-		uc.state = StatePaused
-		select {
-		case uc.pauseCh <- struct{}{}:
-		default:
-		}
-	}
+	uc.state = StatePaused
 }
 
 // Resume resumes the upload
